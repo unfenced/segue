@@ -5,13 +5,17 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .model import Playlist, PlaylistEntry, ServiceRef, Track, normalize, normalize_isrc
+from .model import (
+    EntryState, Playlist, PlaylistEntry, PlaylistState, ServiceRef, Track, normalize, normalize_isrc,
+)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Two durations further apart than this mean two different recordings.
 DURATION_TOLERANCE_MS = 3000
@@ -40,7 +44,8 @@ CREATE TABLE track_refs (
 CREATE INDEX track_refs_track ON track_refs(track_id);
 
 CREATE TABLE playlists (
-    id             INTEGER PRIMARY KEY,
+    -- AUTOINCREMENT: IDs are never reused, so the change log can always tell playlists apart.
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
     name           TEXT NOT NULL,
     description    TEXT,
     source_service TEXT,
@@ -48,6 +53,7 @@ CREATE TABLE playlists (
     source_url     TEXT,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
+    revision       INTEGER NOT NULL DEFAULT 0,   -- bumped on every change
     UNIQUE (source_service, source_id)
 );
 
@@ -64,6 +70,63 @@ CREATE TABLE playlist_entries (
 );
 CREATE INDEX playlist_entries_track ON playlist_entries(track_id);
 """
+
+_LOG_SCHEMA = """
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- The change log. A batch is one user action (e.g. a merge); its operations are applied,
+-- undone and redone together.
+CREATE TABLE batches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    description TEXT NOT NULL,
+    status      TEXT NOT NULL,              -- pending | applied | undone | discarded
+    expected    TEXT NOT NULL DEFAULT '{}', -- JSON {playlist_id: revision} when planned
+    created_at  TEXT NOT NULL,
+    applied_at  TEXT,
+    undone_at   TEXT,
+    -- Increases on every apply, undo and redo, so "the last change" is unambiguous.
+    changed_seq INTEGER
+);
+
+CREATE TABLE operations (
+    batch_id    INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    seq         INTEGER NOT NULL,
+    op          TEXT NOT NULL,   -- JSON of the planned operation
+    playlist_id INTEGER,         -- known once applied (a create gets its ID then)
+    before      TEXT,            -- JSON PlaylistState snapshots, NULL = no playlist
+    after       TEXT,
+    PRIMARY KEY (batch_id, seq)
+);
+"""
+
+_SCHEMA += _LOG_SCHEMA
+
+# Upgrades from each older schema version to the next.
+_MIGRATIONS = {
+    2: """
+CREATE TABLE playlists_v2 (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL,
+    description    TEXT,
+    source_service TEXT,
+    source_id      TEXT,
+    source_url     TEXT,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    revision       INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (source_service, source_id)
+);
+INSERT INTO playlists_v2 (id, name, description, source_service, source_id, source_url,
+                          created_at, updated_at)
+    SELECT id, name, description, source_service, source_id, source_url, created_at, updated_at
+    FROM playlists;
+DROP TABLE playlists;
+ALTER TABLE playlists_v2 RENAME TO playlists;
+""" + _LOG_SCHEMA,
+}
 
 
 def default_db_path() -> Path:
@@ -90,8 +153,9 @@ class Store:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys = ON")
+        self._depth = 0
         self._migrate()
+        self.db.execute("PRAGMA foreign_keys = ON")
 
     def __enter__(self) -> Store:
         return self
@@ -103,15 +167,34 @@ class Store:
         self.db.close()
 
     def _migrate(self) -> None:
+        # Runs with foreign keys off, so rebuilding a table doesn't cascade-delete its rows.
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version == 0:
-            with self.db:
-                self.db.executescript(_SCHEMA)
-                self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif version > SCHEMA_VERSION:
+        if version > SCHEMA_VERSION:
             raise RuntimeError(
                 f"Library was created by a newer Segue (schema {version}); please upgrade."
             )
+        if version == SCHEMA_VERSION:
+            return
+        steps = [_SCHEMA] if version == 0 else [_MIGRATIONS[v] for v in range(version + 1, SCHEMA_VERSION + 1)]
+        script = "".join(steps)
+        self.db.executescript(f"BEGIN;\n{script}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;")
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Group writes; nested calls join the outermost transaction."""
+        if self._depth:
+            self._depth += 1
+            try:
+                yield
+            finally:
+                self._depth -= 1
+            return
+        self._depth = 1
+        try:
+            with self.db:
+                yield
+        finally:
+            self._depth = 0
 
     # Tracks
 
@@ -218,7 +301,7 @@ class Store:
           tracks in the same order exists (e.g. the same backup imported twice).
         - ``"added"``: anything else.
         """
-        with self.db:
+        with self.transaction():
             track_ids = [self.resolve_track(entry.track) for entry in playlist.entries]
             existing = None
             if playlist.source:
@@ -233,8 +316,8 @@ class Store:
             if existing:
                 playlist_id = existing[0]
                 self.db.execute(
-                    "UPDATE playlists SET name = ?, description = ?, source_url = ?, updated_at = ?"
-                    " WHERE id = ?",
+                    "UPDATE playlists SET name = ?, description = ?, source_url = ?, updated_at = ?,"
+                    " revision = revision + 1 WHERE id = ?",
                     (playlist.name, playlist.description, playlist.source.url, now, playlist_id),
                 )
                 self.db.execute("DELETE FROM playlist_entries WHERE playlist_id = ?", (playlist_id,))
@@ -242,21 +325,15 @@ class Store:
                 src = playlist.source
                 cur = self.db.execute(
                     "INSERT INTO playlists (name, description, source_service, source_id, source_url,"
-                    " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    " created_at, updated_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
                     (playlist.name, playlist.description, src and src.service, src and src.id,
                      src and src.url, now, now),
                 )
                 playlist_id = cur.lastrowid
-            self.db.executemany(
-                "INSERT INTO playlist_entries"
-                " (playlist_id, position, track_id, added_at, ref_service, ref_id)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                [
-                    (playlist_id, position, track_id, entry.added_at,
-                     *_entry_ref(entry, playlist.source))
-                    for position, (track_id, entry) in enumerate(zip(track_ids, playlist.entries))
-                ],
-            )
+            self._insert_entries(playlist_id, [
+                EntryState(track_id, entry.added_at, *_entry_ref(entry, playlist.source))
+                for track_id, entry in zip(track_ids, playlist.entries)
+            ])
         playlist.id = playlist_id
         return playlist_id, "replaced" if existing else "added"
 
@@ -313,8 +390,103 @@ class Store:
         return [self.get_playlist(s.id) for s in self.playlist_summaries()]
 
     def delete_playlist(self, playlist_id: int) -> None:
-        with self.db:
+        with self.transaction():
             self.db.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+
+    def find_by_source(self, source: ServiceRef) -> int | None:
+        row = self.db.execute(
+            "SELECT id FROM playlists WHERE source_service = ? AND source_id = ?",
+            (source.service, source.id),
+        ).fetchone()
+        return row[0] if row else None
+
+    # Playlist states, used by the change log
+
+    def playlist_state(self, playlist_id: int) -> PlaylistState | None:
+        row = self.db.execute("SELECT * FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+        if row is None:
+            return None
+        entries = self.db.execute(
+            "SELECT track_id, added_at, ref_service, ref_id FROM playlist_entries"
+            " WHERE playlist_id = ? ORDER BY position",
+            (playlist_id,),
+        )
+        return PlaylistState(
+            name=row["name"], description=row["description"], source=self._source(row),
+            entries=tuple(EntryState(*e) for e in entries),
+        )
+
+    def revision(self, playlist_id: int) -> int | None:
+        row = self.db.execute("SELECT revision FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+        return row[0] if row else None
+
+    def create_state(self, state: PlaylistState) -> int:
+        """Add a new playlist with this state and return its ID."""
+        with self.transaction():
+            now = _now()
+            src = state.source
+            cur = self.db.execute(
+                "INSERT INTO playlists (name, description, source_service, source_id, source_url,"
+                " created_at, updated_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                (state.name, state.description, src and src.service, src and src.id,
+                 src and src.url, now, now),
+            )
+            self._insert_entries(cur.lastrowid, state.entries)
+        return cur.lastrowid
+
+    def write_state(self, playlist_id: int, state: PlaylistState | None) -> None:
+        """Make playlist ``playlist_id`` look exactly like ``state``.
+
+        ``None`` deletes it; a state for a missing ID recreates it under that same ID
+        (this is how undoing a delete brings a playlist back).
+        """
+        with self.transaction():
+            if state is None:
+                self.db.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+                return
+            now = _now()
+            src = state.source
+            values = (state.name, state.description, src and src.service, src and src.id,
+                      src and src.url)
+            if self.revision(playlist_id) is None:
+                self.db.execute(
+                    "INSERT INTO playlists (id, name, description, source_service, source_id,"
+                    " source_url, created_at, updated_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                    (playlist_id, *values, now, now),
+                )
+            else:
+                self.db.execute(
+                    "UPDATE playlists SET name = ?, description = ?, source_service = ?, source_id = ?,"
+                    " source_url = ?, updated_at = ?, revision = revision + 1 WHERE id = ?",
+                    (*values, now, playlist_id),
+                )
+                self.db.execute("DELETE FROM playlist_entries WHERE playlist_id = ?", (playlist_id,))
+            self._insert_entries(playlist_id, state.entries)
+
+    def _insert_entries(self, playlist_id: int, entries) -> None:
+        self.db.executemany(
+            "INSERT INTO playlist_entries"
+            " (playlist_id, position, track_id, added_at, ref_service, ref_id)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (playlist_id, position, e.track_id, e.added_at, e.ref_service, e.ref_id)
+                for position, e in enumerate(entries)
+            ],
+        )
+
+    # Settings
+
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        row = self.db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.transaction():
+            self.db.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?)"
+                " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
 
     @staticmethod
     def _source(row: sqlite3.Row) -> ServiceRef | None:

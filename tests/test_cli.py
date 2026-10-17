@@ -15,10 +15,10 @@ def test_import_list_show_export_backup(tmp_path, sample_playlists, capsys):
     assert "added 'Road trip' (3 tracks)" in out
     assert "library: 3 tracks (3 new)" in out
 
-    # Re-importing: playlists with a source are replaced, identical ones are skipped.
+    # Re-importing identical playlists changes nothing and isn't logged.
     run(tmp_path, "import", str(source))
     out = capsys.readouterr().out
-    assert "replaced 'Road trip'" in out and "unchanged 'Chill'" in out
+    assert "unchanged 'Road trip'" in out and "unchanged 'Chill'" in out
 
     run(tmp_path, "list")
     out = capsys.readouterr().out
@@ -53,3 +53,44 @@ def test_single_m3u_needs_one_playlist(tmp_path, sample_playlists, capsys):
     run(tmp_path, "import", str(source))
     assert run(tmp_path, "export", str(tmp_path / "all.m3u8")) == 1
     assert run(tmp_path, "export", str(tmp_path / "chill.m3u8"), "-p", "Chill") == 0
+
+
+def test_change_commands_queue_commit_undo(tmp_path, sample_playlists, capsys):
+    source = tmp_path / "in.json"
+    json_format.write(sample_playlists, source)
+    run(tmp_path, "import", str(source))
+    capsys.readouterr()
+
+    assert run(tmp_path, "merge", "Chill", "Empty one", "--into", "Road trip", "--delete-sources") == 0
+    out = capsys.readouterr().out
+    assert "delete 'Chill' (2 tracks)" in out and "queued as #" in out
+
+    run(tmp_path, "pending")
+    assert "merge 'Chill', 'Empty one' into 'Road trip'" in capsys.readouterr().out
+
+    run(tmp_path, "commit")
+    assert "applied #" in capsys.readouterr().out
+    run(tmp_path, "list")
+    out = capsys.readouterr().out
+    assert "Chill" not in out and "Road trip" in out
+
+    run(tmp_path, "undo")
+    run(tmp_path, "list")
+    assert "Chill" in capsys.readouterr().out
+
+    run(tmp_path, "history")
+    out = capsys.readouterr().out
+    assert "undone" in out and "import 'Road trip' from in.json" in out
+
+
+def test_dry_run_and_now(tmp_path, sample_playlists, capsys):
+    source = tmp_path / "in.json"
+    json_format.write(sample_playlists, source)
+    run(tmp_path, "import", str(source))
+    run(tmp_path, "rename", "Chill", "Calm", "--dry-run")
+    assert "dry run" in capsys.readouterr().out
+    run(tmp_path, "rename", "Chill", "Calm", "--now")
+    assert "applied as #" in capsys.readouterr().out
+    run(tmp_path, "config", "apply-mode", "auto")
+    run(tmp_path, "delete", "Calm")
+    assert "applied as #" in capsys.readouterr().out

@@ -6,9 +6,14 @@ so switching away from Spotify (or any other service) takes minutes, not weekend
 
 ## Status
 
-Step 1 is done: the neutral track library, SQLite store, and JSON/CSV/M3U import and export
-(see the build order below). There are no service connectors yet. You can already import
-playlist exports from other tools, such as [Exportify](https://exportify.net) CSVs for Spotify.
+Steps 1 and 2 are done (see the build order below):
+
+- the neutral track library, the SQLite store, and JSON/CSV/M3U import and export;
+- the change log, with commit or auto mode, undo and redo.
+
+There are no service connectors yet, so changes apply to Segue's own library. You can
+already import playlist exports from other tools, such as [Exportify](https://exportify.net)
+CSVs for Spotify, and clean them up.
 
 ```bash
 uv run segue import "Liked Songs.csv" road-trip.m3u8 backup.json
@@ -17,6 +22,19 @@ uv run segue show "road trip"
 uv run segue export everything.csv              # or .json; a folder name → one .m3u8 per playlist
 uv run segue export chill.m3u8 -p Chill --prefer spotify
 uv run segue backup                             # timestamped JSON + CSV next to the library
+
+uv run segue dedupe "road trip"                 # plans a change: queued in commit mode
+uv run segue merge Chill "Chill 2" --into Chill --delete-sources
+uv run segue merge A B C --new "Everything" --dry-run
+uv run segue rename 3 "Gym"
+uv run segue delete Old
+uv run segue remove Gym 4 7                     # positions as shown by: segue show Gym
+uv run segue pending                            # review what's queued
+uv run segue commit                             # apply it (or: segue discard)
+uv run segue history
+uv run segue undo                               # last change; or: segue undo 12
+uv run segue redo
+uv run segue config apply-mode auto             # or commit (default); --now / --queue per command
 uv run pytest
 ```
 
@@ -29,7 +47,9 @@ The library lives at `~/.segue/segue.db`; override it with `--db` or `SEGUE_DB`.
 | M3U8 | Media players | Title, artists, length, album and one link or file path; tracks without either are left out |
 
 Importing is safe to repeat. A playlist with a service ID replaces its earlier copy, and an
-identical playlist without one is skipped instead of duplicated.
+identical playlist is skipped instead of duplicated. Imports only touch Segue's own library,
+so they apply right away in either mode, but they are logged: an import that replaced a
+playlist can be undone.
 
 ## Goals
 
@@ -61,21 +81,25 @@ first. The user chooses how those are applied:
   of it, or none.
 - **Auto mode:** operations are applied right away, but still logged and undoable.
 
+Each user action becomes one **batch** of operations (create, delete, edit, add, remove,
+reorder). In commit mode, a batch records the revision of every playlist it touches. If one
+of those playlists changes before you commit, the batch is refused as **stale** rather than
+applied to positions that no longer mean the same thing.
+
 ### 3. Undo
 
-Every applied operation is written to an **operation log** together with its inverse:
+Every applied operation stores a **snapshot** of its playlist before and after. Undo writes
+the "before" back, but only if the playlist still matches "after". So an undo never silently
+overwrites a later change: Segue names the later batch to undo first. Redo works the same
+way in reverse. Undo and redo work per batch, by default the most recent one.
 
-| Operation | Inverse |
-|---|---|
-| Add tracks | Remove those tracks |
-| Remove tracks | Re-add them at their original positions |
-| Reorder | Restore the previous order |
-| Rename / edit description | Restore the previous values |
-| Delete playlist | Recreate it from the snapshot |
+Snapshots also make undo exact: positions, "added" dates and each entry's service ID come
+back as they were, and a deleted playlist returns under its old library ID.
 
-Undo works per operation or per batch. One limit is unavoidable: a deleted playlist that is
-recreated gets a **new ID**, so its followers, share link and collaborators are lost. Segue
-warns about this before a delete.
+Limits once real services are connected:
+- A playlist deleted on a service comes back with a **new ID**, so its followers, share link
+  and collaborators are lost. Segue warns about this before a delete.
+- Tracks removed and re-added on a service get a new "date added" there.
 
 ## Batch tools
 
@@ -154,15 +178,16 @@ Every connector declares **how** it connects and **what** the connection allows:
   sync rules and the operation log.
 - **Engine**: matching, dedupe, merge, diff and sync planning. Produces planned operations;
   never writes to a service directly.
-- **Executor**: applies planned operations (commit or auto mode), records each one with its
-  inverse, and handles rate limits and partial failures (a failed batch can be resumed or
-  rolled back).
+- **Change log** (`changes.py`): applies planned operations (commit or auto mode) and
+  records before/after snapshots for undo and redo. Locally a batch is all-or-nothing. With
+  services it will also need to handle rate limits and partial failures (resume, or roll back
+  the part that was written).
 - **Interface**: start with a CLI, then a local web UI.
 
 ## Build order (working plan)
 
 1. ✅ Neutral model + SQLite store + CSV/JSON/M3U import/export (this is also the backup).
-2. Planned operations, operation log and undo — tested against the local-files "service".
+2. ✅ Planned operations, operation log and undo, applied to Segue's own library.
 3. Spotify connector (read, then write) behind the mandatory backup gate.
 4. Cleanup and batch tools: duplicates, merge by name, bulk delete, with previews.
 5. Second connector (YouTube Music or Apple Music) + cross-service matching.

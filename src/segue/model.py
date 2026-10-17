@@ -78,3 +78,54 @@ def normalize_isrc(isrc: str | None) -> str | None:
         return None
     cleaned = re.sub(r"[^A-Za-z0-9]", "", isrc).upper()
     return cleaned or None
+
+
+@dataclass(frozen=True)
+class EntryState:
+    """One playlist position as stored: a library track plus what came with it."""
+
+    track_id: int
+    added_at: str | None = None
+    ref_service: str | None = None
+    ref_id: str | None = None
+
+    def to_dict(self) -> dict:
+        return {"track_id": self.track_id, "added_at": self.added_at,
+                "ref_service": self.ref_service, "ref_id": self.ref_id}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> EntryState:
+        return cls(data["track_id"], data.get("added_at"), data.get("ref_service"), data.get("ref_id"))
+
+
+@dataclass(frozen=True)
+class PlaylistState:
+    """Everything that defines a stored playlist; what the change log snapshots."""
+
+    name: str
+    description: str | None = None
+    source: ServiceRef | None = None
+    entries: tuple[EntryState, ...] = ()
+
+    @property
+    def track_ids(self) -> list[int]:
+        return [e.track_id for e in self.entries]
+
+    def to_dict(self) -> dict:
+        src = self.source
+        return {
+            "name": self.name,
+            "description": self.description,
+            "source": {"service": src.service, "id": src.id, "url": src.url} if src else None,
+            "entries": [e.to_dict() for e in self.entries],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> PlaylistState:
+        src = data.get("source")
+        return cls(
+            name=data["name"],
+            description=data.get("description"),
+            source=ServiceRef(src["service"], src["id"], src.get("url")) if src else None,
+            entries=tuple(EntryState.from_dict(e) for e in data.get("entries", [])),
+        )
