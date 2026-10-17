@@ -13,15 +13,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
 import secrets
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
+
+from .common import SecretFile, Transport, urllib_transport
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -38,9 +36,6 @@ SCOPES = (
     "user-follow-modify",
 )
 
-# (method, url, headers, body) -> (status, lower-cased headers, body)
-Transport = Callable[[str, str, dict, bytes | None], tuple[int, dict, bytes]]
-
 MAX_RETRIES = 5
 MAX_WAIT_SECONDS = 60
 
@@ -52,43 +47,7 @@ class SpotifyError(Exception):
         self.message = message
 
 
-def urllib_transport(method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
-    request = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read()
-    except urllib.error.HTTPError as e:
-        return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
-
-
-# Token storage
-
-class TokenStore:
-    """The Client ID and login token, in a file only the owner can read."""
-
-    def __init__(self, path: Path):
-        self.path = Path(path)
-
-    def load(self) -> dict | None:
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError):
-            return None
-        return data if isinstance(data, dict) else None
-
-    def save(self, data: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.chmod(self.path, 0o600)  # also tighten a file that already existed
-
-    def clear(self) -> bool:
-        try:
-            self.path.unlink()
-            return True
-        except FileNotFoundError:
-            return False
+TokenStore = SecretFile  # the Client ID and login token
 
 
 # Login

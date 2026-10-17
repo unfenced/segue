@@ -43,6 +43,7 @@ class Track:
 class PlaylistEntry:
     track: Track
     added_at: str | None = None  # ISO 8601, as given by the source
+    handle: str | None = None  # the service's own ID for this entry (e.g. Qobuz playlist_track_id)
 
 
 # How a playlist relates to its owner on the service.
@@ -98,14 +99,16 @@ class EntryState:
     added_at: str | None = None
     ref_service: str | None = None
     ref_id: str | None = None
+    handle: str | None = None  # the service's ID for this entry, where the service has one
 
     def to_dict(self) -> dict:
         return {"track_id": self.track_id, "added_at": self.added_at,
-                "ref_service": self.ref_service, "ref_id": self.ref_id}
+                "ref_service": self.ref_service, "ref_id": self.ref_id, "handle": self.handle}
 
     @classmethod
     def from_dict(cls, data: dict) -> EntryState:
-        return cls(data["track_id"], data.get("added_at"), data.get("ref_service"), data.get("ref_id"))
+        return cls(data["track_id"], data.get("added_at"), data.get("ref_service"), data.get("ref_id"),
+                   data.get("handle"))
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,15 @@ class PlaylistState:
     @property
     def track_ids(self) -> list[int]:
         return [e.track_id for e in self.entries]
+
+    def content(self) -> tuple:
+        """What the user sees and changes: name, description, kind and the tracks in order.
+
+        Leaves out what only a service sets (the playlist's service ID, entry IDs and dates),
+        so a commit that fills those in doesn't count as a change.
+        """
+        return (self.name, self.description, self.kind,
+                tuple((e.track_id, e.ref_service, e.ref_id) for e in self.entries))
 
     def to_dict(self) -> dict:
         src = self.source

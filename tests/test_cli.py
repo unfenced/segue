@@ -69,7 +69,7 @@ def test_stage_undo_commit(tmp_path, sample_playlists, capsys):
     run(tmp_path, "rename", "Chill", "Everything")
     run(tmp_path, "pending")
     out = capsys.readouterr().out
-    assert "commit will write:" in out and "'Everything': renamed from 'Chill', +1 track" in out
+    assert "net change:" in out and "'Everything': renamed from 'Chill', +1 track" in out
 
     run(tmp_path, "undo")
     run(tmp_path, "list")
@@ -179,3 +179,41 @@ def test_organizing_commands(tmp_path, capsys):
 
     assert run(tmp_path, "delete") == 1
     assert "choose them with a filter" in capsys.readouterr().err
+
+
+def test_qobuz_pull_organize_commit(tmp_path, capsys, monkeypatch):
+    from segue import cli
+    from segue.connectors import qobuz as qobuz_module
+    from .fake_qobuz import FakeQobuz
+
+    fake = FakeQobuz()
+    gym = fake.add_playlist("Gym", [1, 2, 1])
+    dup = fake.add_playlist("gym (1)", [3])
+    service = qobuz_module.QobuzService(qobuz_module.QobuzClient(
+        {"app_id": fake.app_id, "user_auth_token": fake.token}, fake, sleep=lambda s: None))
+    monkeypatch.setattr(cli, "_services", lambda args: {"qobuz": service})
+
+    assert run(tmp_path, "pull", "qobuz") == 0
+    assert "3 added" in capsys.readouterr().out  # two playlists and Liked songs
+    run(tmp_path, "setup", "--duplicates", "recording")
+    run(tmp_path, "dedupe", "Gym")
+    run(tmp_path, "merge-names", "--backup")
+    run(tmp_path, "pending")
+    out = capsys.readouterr().out
+    assert "commit will write:" in out and "Qobuz: delete 'gym (1)'" in out
+
+    # The merge made a backup, but a fresh pull since would need another; here it's covered.
+    assert run(tmp_path, "commit") == 0
+    out = capsys.readouterr().out
+    assert "Qobuz: wrote 'Gym'" in out and "final now" in out
+    assert fake.tracks_of(gym) == ["1", "2", "3"] and dup not in fake.playlists
+
+    # Auto mode writes right away, and asks for a backup after a new pull.
+    run(tmp_path, "pull", "qobuz")
+    run(tmp_path, "config", "apply-mode", "auto")
+    capsys.readouterr()
+    assert run(tmp_path, "rename", "Gym", "Gym 2") == 1
+    assert "no backup since you last pulled from qobuz" in capsys.readouterr().err.lower()
+    assert fake.playlists[gym]["name"] == "Gym"
+    assert run(tmp_path, "rename", "Gym", "Gym 2", "--backup") == 0
+    assert fake.playlists[gym]["name"] == "Gym 2"

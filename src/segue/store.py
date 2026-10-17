@@ -16,7 +16,7 @@ from .model import (
     EntryState, Playlist, PlaylistEntry, PlaylistState, ServiceRef, Track, normalize, normalize_isrc,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Two durations further apart than this mean two different recordings.
 DURATION_TOLERANCE_MS = 3000
@@ -69,6 +69,7 @@ CREATE TABLE playlist_entries (
     -- one service (re-releases, regional copies); this keeps restores exact.
     ref_service TEXT,
     ref_id      TEXT,
+    handle      TEXT,   -- the service's own ID for this entry, e.g. Qobuz playlist_track_id
     PRIMARY KEY (playlist_id, position)
 );
 CREATE INDEX playlist_entries_track ON playlist_entries(track_id);
@@ -135,7 +136,7 @@ CREATE TABLE batches (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     description TEXT NOT NULL,
     status      TEXT NOT NULL,   -- staged | committed | undone | discarded
-    mode        TEXT NOT NULL,   -- safe | auto | import
+    mode        TEXT NOT NULL,   -- safe | auto | import | pull
     created_at  TEXT NOT NULL,
     applied_at  TEXT,
     undone_at   TEXT,
@@ -154,7 +155,20 @@ CREATE TABLE operations (
 );
 """ + _BACKUP_SCHEMA
 
-_SCHEMA += _LOG_SCHEMA
+_REMOTE_SCHEMA = """
+-- What each service last had for a playlist (read on pull, refreshed after each write).
+-- A commit writes the difference between this and the playlist's current state.
+CREATE TABLE remote_state (
+    playlist_id INTEGER NOT NULL,
+    service     TEXT NOT NULL,
+    remote_id   TEXT NOT NULL,
+    state       TEXT NOT NULL,   -- JSON PlaylistState
+    read_at     TEXT NOT NULL,
+    PRIMARY KEY (playlist_id, service)
+);
+"""
+
+_SCHEMA += _LOG_SCHEMA + _REMOTE_SCHEMA
 
 # Upgrades from each older schema version to the next.
 _MIGRATIONS = {
@@ -190,6 +204,7 @@ UPDATE settings SET value = 'safe' WHERE key = 'apply_mode' AND value = 'commit'
 UPDATE settings SET value = 'auto' WHERE key = 'apply_mode' AND value NOT IN ('safe', 'auto');
 """ + _BACKUP_SCHEMA,
     4: "ALTER TABLE tracks ADD COLUMN release_date TEXT;",
+    5: "ALTER TABLE playlist_entries ADD COLUMN handle TEXT;" + _REMOTE_SCHEMA,
 }
 
 
@@ -406,7 +421,7 @@ class Store:
                 )
                 playlist_id = cur.lastrowid
             self._insert_entries(playlist_id, [
-                EntryState(track_id, entry.added_at, *_entry_ref(entry, playlist.source))
+                EntryState(track_id, entry.added_at, *_entry_ref(entry, playlist.source), entry.handle)
                 for track_id, entry in zip(track_ids, playlist.entries)
             ])
         playlist.id = playlist_id
@@ -444,7 +459,7 @@ class Store:
         if row is None:
             raise KeyError(f"No playlist with id {playlist_id}")
         entries = self.db.execute(
-            "SELECT track_id, added_at, ref_service, ref_id FROM playlist_entries"
+            "SELECT track_id, added_at, ref_service, ref_id, handle FROM playlist_entries"
             " WHERE playlist_id = ? ORDER BY position",
             (playlist_id,),
         ).fetchall()
@@ -452,7 +467,8 @@ class Store:
         return Playlist(
             id=row["id"], name=row["name"], description=row["description"],
             source=self._source(row), kind=row["kind"],
-            entries=[PlaylistEntry(_with_ref_first(tracks[e["track_id"]], e), e["added_at"]) for e in entries],
+            entries=[PlaylistEntry(_with_ref_first(tracks[e["track_id"]], e), e["added_at"], e["handle"])
+                     for e in entries],
         )
 
     def find_playlists(self, name: str) -> list[Playlist]:
@@ -483,7 +499,7 @@ class Store:
         if row is None:
             return None
         entries = self.db.execute(
-            "SELECT track_id, added_at, ref_service, ref_id FROM playlist_entries"
+            "SELECT track_id, added_at, ref_service, ref_id, handle FROM playlist_entries"
             " WHERE playlist_id = ? ORDER BY position",
             (playlist_id,),
         )
@@ -496,7 +512,7 @@ class Store:
         """The stored form of a playlist read from a file, adding any new tracks to the library."""
         with self.transaction():
             entries = tuple(
-                EntryState(self.resolve_track(e.track), e.added_at, *_entry_ref(e, playlist.source))
+                EntryState(self.resolve_track(e.track), e.added_at, *_entry_ref(e, playlist.source), e.handle)
                 for e in playlist.entries
             )
         return PlaylistState(playlist.name, playlist.description, playlist.source, entries, playlist.kind)
@@ -552,13 +568,40 @@ class Store:
     def _insert_entries(self, playlist_id: int, entries) -> None:
         self.db.executemany(
             "INSERT INTO playlist_entries"
-            " (playlist_id, position, track_id, added_at, ref_service, ref_id)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            " (playlist_id, position, track_id, added_at, ref_service, ref_id, handle)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             [
-                (playlist_id, position, e.track_id, e.added_at, e.ref_service, e.ref_id)
+                (playlist_id, position, e.track_id, e.added_at, e.ref_service, e.ref_id, e.handle)
                 for position, e in enumerate(entries)
             ],
         )
+
+    # What services last had
+
+    def remote_links(self, playlist_id: int | None = None) -> list[tuple[int, str, str, PlaylistState]]:
+        """``(playlist_id, service, remote_id, state)`` for one playlist, or for all."""
+        query = "SELECT playlist_id, service, remote_id, state FROM remote_state"
+        params: tuple = ()
+        if playlist_id is not None:
+            query += " WHERE playlist_id = ?"
+            params = (playlist_id,)
+        return [
+            (row[0], row[1], row[2], PlaylistState.from_dict(json.loads(row[3])))
+            for row in self.db.execute(query + " ORDER BY playlist_id, service", params)
+        ]
+
+    def set_remote(self, playlist_id: int, service: str, remote_id: str, state: PlaylistState) -> None:
+        with self.transaction():
+            self.db.execute(
+                "INSERT INTO remote_state (playlist_id, service, remote_id, state, read_at) VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT (playlist_id, service) DO UPDATE SET remote_id = excluded.remote_id,"
+                " state = excluded.state, read_at = excluded.read_at",
+                (playlist_id, service, remote_id, json.dumps(state.to_dict()), _now()),
+            )
+
+    def remove_remote(self, playlist_id: int, service: str) -> None:
+        with self.transaction():
+            self.db.execute("DELETE FROM remote_state WHERE playlist_id = ? AND service = ?", (playlist_id, service))
 
     # Settings
 

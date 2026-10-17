@@ -34,7 +34,8 @@ def write_backup(store: Store, folder: Path) -> list[Path]:
     with store.transaction():
         cur = store.db.execute(
             "INSERT INTO backups (created_at, paths) VALUES (?, ?)",
-            (datetime.now(timezone.utc).isoformat(timespec="seconds"), json.dumps([str(p) for p in paths])),
+            # Microseconds: compared with pull times, which can fall in the same second.
+            (datetime.now(timezone.utc).isoformat(timespec="microseconds"), json.dumps([str(p) for p in paths])),
         )
         store.db.executemany(
             "INSERT INTO backup_playlists (backup_id, playlist_id, revision) VALUES (?, ?, ?)",

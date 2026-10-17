@@ -2,6 +2,10 @@
 
 How Segue connects to Spotify, what Spotify allows, and how to set it up.
 
+> **Coming next:** signing in with the Spotify web player's session cookie (`sp_dc`), the way
+> SongMirror does it. That needs no developer app and no Premium. The developer-app route below
+> needs the app's owner to have Premium.
+
 ## What a development-mode app can do (October 2026)
 
 Segue uses your own Spotify developer app in **development mode**: free, for up to 5 users,

@@ -199,6 +199,15 @@ meantime (for example, edited on your phone), it shows the conflict instead of o
 | [Exportify](https://github.com/watsonbox/exportify), [spotify-backup](https://github.com/caseychu/spotify-backup) (MIT) | — | Export only | The CSV format people already have (Segue imports it) |
 | [spotify_to_ytmusic](https://github.com/sigma67/spotify_to_ytmusic) (MIT), [spotify_to_tidal](https://github.com/spotify2tidal/spotify_to_tidal) (AGPL) | — | One-direction transfer tools | Matching approaches. spotify_to_tidal is AGPL, so read it but don't copy its code into MIT-licensed Segue |
 
+## Decided
+
+- **Where organized playlists show up is the user's choice, and can be several services**
+  (`destinations`). Edits to a service's playlist go back to that service; new playlists go to
+  every destination.
+- **Sign-in uses the web players' sessions** (Spotify's `sp_dc` cookie, Qobuz's session token),
+  like SongMirror, so no Premium or developer app is needed. This is unofficial, and the docs say
+  so.
+
 ## Open questions
 
 1. **Sync while organizing.** Say Spotify *Gym* and *Gym 2* are both synced to TIDAL, and you

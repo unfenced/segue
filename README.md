@@ -18,12 +18,15 @@ Steps 1–4 are done (see the build order below):
 - the organizing tools: merge by name, bulk delete and rename by filter, sort, shuffle, split,
   clone, find, and `check` (the "Needs a look" list).
 
-Step 5 has started: Segue can log in to Spotify with your own developer app
-(`segue spotify connect`), and `segue spotify probe` tests what that app may read and change.
-See **[docs/spotify.md](docs/spotify.md)** for the setup. Reading your Spotify library into
-Segue and writing commits back come next. Until then, changes apply to Segue's own library;
-you can import playlist exports from other tools, such as [Exportify](https://exportify.net)
-CSVs for Spotify, and clean them up.
+**Qobuz works end to end** (step 5): connect with a session copied from the web player,
+`segue pull qobuz` reads your playlists and favorites, and `segue commit` writes your
+organizing back by editing playlists in place. Setup: **[docs/qobuz.md](docs/qobuz.md)**. It's
+tested against a simulated Qobuz; run `segue qobuz probe` to check it on your account.
+
+**Spotify:** next up is the web player's session cookie, the way SongMirror does it, so no
+Premium or developer app is needed. Until then: `segue spotify connect` works with your own
+developer app (which needs Premium; see [docs/spotify.md](docs/spotify.md)), and you can import
+[Exportify](https://exportify.net) CSVs.
 
 ```bash
 uv run segue setup                              # what counts as a duplicate, safe or auto mode
@@ -59,8 +62,22 @@ uv run segue clone Gym                          # "Gym (copy)"
 uv run segue find "hey jude"                    # which playlists contain it, at which positions
 uv run segue find --overlaps                    # playlists that are copies or subsets of others
 uv run segue find --liked-only                  # liked songs in no other playlist
+
+uv run segue qobuz connect                      # paste a request copied from play.qobuz.com
+uv run segue qobuz probe                        # what works on your account
+uv run segue pull qobuz                         # your Qobuz library into Segue
+uv run segue commit                             # writes staged changes to Qobuz, then final
+uv run segue commit --local                     # final in Segue only; writes nothing
+uv run segue config destinations qobuz,spotify  # where new playlists show up (one or more)
 uv run pytest
 ```
+
+**Where organized playlists show up.** Changes to a playlist that came from a service are
+written back to that service. New playlists made by organizing (`merge --new`, `split`,
+`clone`, restores) are created on every service in `destinations`: one, or several. The default
+is the services you've pulled from. A service that isn't connected yet is skipped, and the
+playlist waits for it. Tracks that have no ID on a service (for example, a Qobuz track and
+Spotify) are kept in Segue and skipped there until cross-service matching (step 7) exists.
 
 Commands that change playlists take `--now` (apply right away), `--stage` (stage for commit)
 or `--dry-run` (only show the preview). Commands that pick several playlists accept names or
@@ -150,7 +167,8 @@ Every connector declares **how** it connects and **what** the connection allows:
 | YouTube Music | Google OAuth **device flow** ("TVs and Limited Input" client) via `ytmusicapi` | Browser cookie headers | Unofficial API; can break |
 | Apple Music | MusicKit JS authorization (needs a paid Apple Developer account for the developer token) | Paste the web player's bearer + `media-user-token` | No subscription means catalog-only access |
 | Deezer | OAuth with an approved app | `refresh-token` cookie | New app registrations were closed as of Aug 2026 |
-| Qobuz, Amazon Music | Partner access only | Web-session tokens | Terms forbid unofficial clients; treat as later or never |
+| Qobuz | ✅ Web player session (`X-App-Id` + `X-User-Auth-Token`); see **[docs/qobuz.md](docs/qobuz.md)** | — | Qobuz gives API keys to partners only, so this is unofficial and against its terms; it can break when the web player changes |
+| Amazon Music | Partner access only | Web-session tokens | Terms forbid unofficial clients; treat as later or never |
 | Files and public links | No account needed | — | Read and import only |
 
 ### Secret handling
@@ -194,9 +212,10 @@ Organizing comes first; transfers and sync come after.
    songs in the model.
 4. ✅ **Organizing tools** on the local library: merge by name, bulk delete and rename by filter,
    sort, split, clone, find, and the "Needs a look" list.
-5. **Spotify connector** (in progress): ✅ login and the `probe` command; next, read
-   playlists (created and followed) and Liked Songs into Segue, commit staged changes by editing
-   in place, so followers and links survive, and detect conflicts before writing.
+5. **Connectors** (in progress): ✅ **Qobuz**: connect, probe, pull, commit in place, conflict
+   checks, a backup before the first write after a pull, and destinations for new playlists.
+   ✅ Spotify login with a developer app and its probe. Next: **Spotify through the web player's
+   session cookie** (no Premium needed), with the same pull and commit.
 6. **Local web UI**: organizing hundreds of playlists needs a visual interface, not just a CLI.
 7. Second connector, cross-service matching, and transfers, including Liked songs.
 8. Sync rules.
@@ -220,7 +239,12 @@ Several ideas here come from its design and research. Credit for them goes to So
 - the secret-handling rules above;
 - modelling Liked songs as one collection with a single internal key, translated per service;
 - sync guards: capped removals, skipping a pass after a suspiciously short read, and never
-  deleting a track just because it has no match.
+  deleting a track just because it has no match;
+- signing in to Qobuz with the web player's session, and most of the Qobuz endpoints.
+
+The Qobuz connector also draws on [Music Assistant](https://github.com/music-assistant/server)
+(Apache-2.0), [qobuzify](https://github.com/matthewprince/qobuzify) (MIT) and
+[vvaidy/qobuz](https://github.com/vvaidy/qobuz); details in [docs/qobuz.md](docs/qobuz.md#credits).
 
 Segue's focus is different: bulk organizing (merge, dedupe, delete and rename by rule),
 mandatory backups, a review-before-apply queue and undo. Where the projects overlap, the

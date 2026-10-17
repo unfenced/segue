@@ -16,7 +16,7 @@ so an undo never silently overwrites a later change. Making a new change clears 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from .model import Playlist, PlaylistState
@@ -37,7 +37,7 @@ class Batch:
     id: int
     description: str
     status: str  # staged | committed | undone | discarded
-    mode: str  # safe | auto | import
+    mode: str  # safe | auto | import | pull
     created_at: str
     applied_at: str | None
     undone_at: str | None
@@ -145,9 +145,13 @@ def staged_changes(store: Store) -> list[tuple[int, PlaylistState | None, Playli
     result = []
     for pid, committed in base.items():
         current = store.playlist_state(pid)
-        if current != committed:
+        if _content(current) != _content(committed):
             result.append((pid, committed, current))
     return result
+
+
+def _content(state: PlaylistState | None):
+    return None if state is None else state.content()
 
 
 def describe_staged(store: Store) -> list[str]:
@@ -209,6 +213,41 @@ def record_import(store: Store, playlist: Playlist, source_name: str) -> tuple[i
     return pid, status, batch_id
 
 
+def record_states(store: Store, description: str, writes: list[tuple[int | None, PlaylistState | None]],
+                  mode: str = "pull") -> tuple[list[int], int | None]:
+    """Write playlist states that came from outside (a pull from a service) as one batch.
+
+    The batch is committed right away. A pull can't be undone: it only copies what the
+    service has (undoing it would make Segue think the service changed). ``None``
+    as an ID adds a new playlist; ``None`` as a state deletes one. Unchanged playlists are
+    skipped. Returns the playlist IDs (in order) and the batch ID, if anything changed.
+    """
+    ids: list[int] = []
+    with store.transaction():
+        batch_id = None
+        seq = 0
+        for pid, state in writes:
+            before = None if pid is None else store.playlist_state(pid)
+            if pid is not None and _content(before) == _content(state) and before == state:
+                ids.append(pid)
+                continue
+            if batch_id is None:
+                _clear_redo(store)
+                batch_id = _new_batch(store, description, mode)
+            if pid is None:
+                pid = store.create_state(state)
+            else:
+                store.write_state(pid, state)
+            name = (state or before).name
+            _record_op(store, batch_id, seq, {"kind": "import", "name": name, "file": description},
+                       pid, before, state)
+            seq += 1
+            ids.append(pid)
+        if batch_id is not None:
+            _set_status(store, batch_id, "committed", "applied_at")
+    return ids, batch_id
+
+
 def commit(store: Store) -> list[int]:
     """Make every staged batch final. Returns their IDs, oldest first."""
     ids = [b.id for b in batches(store, ["staged"])]
@@ -260,6 +299,15 @@ def redo(store: Store, batch_id: int | None = None) -> int:
     return batch_id
 
 
+def next_undo(store: Store) -> int | None:
+    """The batch ``undo`` would undo by default."""
+    return _latest(store, ["staged", "committed"])
+
+
+def next_redo(store: Store) -> int | None:
+    return _latest(store, ["undone"])
+
+
 def can_undo(store: Store, batch: Batch) -> bool:
     """Whether undoing ``batch`` would work right now (allowed, and nothing later in the way)."""
     if _why_not_undoable(store, batch) is not None:
@@ -276,6 +324,8 @@ def _why_not_undoable(store: Store, batch: Batch) -> str | None:
         return f"it is {batch.status}"
     if batch.mode == "safe":
         return "it was committed. Committed changes are final; restore a backup to go back"
+    if batch.mode == "pull":
+        return "a pull only copies what the service has; pull again, or restore a backup"
     limit = undo_limit(store)
     recent = [
         row[0] for row in store.db.execute(
@@ -296,7 +346,8 @@ def _revert(store: Store, batch_id: int) -> None:
 
 def _swap(store: Store, batch_id: int, pid: int, expect, write, verb: str) -> None:
     current = store.playlist_state(pid)
-    if current != expect:
+    # Compare what the user can see: a commit may have filled in service IDs since.
+    if _content(current) != _content(expect):
         name = (current or expect or write).name
         later = _later_batch_touching(store, batch_id, pid)
         if later and verb == "undo":
@@ -304,6 +355,8 @@ def _swap(store: Store, batch_id: int, pid: int, expect, write, verb: str) -> No
         else:
             reason = f"{name!r} has changed since"
         raise ChangeError(f"can't {verb} #{batch_id}: {reason}")
+    if write is not None and current is not None and write.source is None and current.source is not None:
+        write = replace(write, source=current.source)  # keep a link a commit made since
     store.write_state(pid, write)
 
 

@@ -7,12 +7,15 @@ import re
 import sys
 from pathlib import Path
 
-from . import __version__, analysis, backup, changes, dupes, edits, select
+from . import __version__, analysis, backup, changes, dupes, edits, remote, select
 from .formats import FORMATS, csv_format, detect_format, json_format, m3u_format, read_playlists
 from .model import Playlist, normalize
-from .connectors import spotify, spotify_probe
+from .connectors import qobuz, qobuz_probe, spotify, spotify_probe
+from .connectors.common import SecretFile
 from .ops import DeletePlaylist
 from .store import Store, default_db_path
+
+SERVICES = ("qobuz", "spotify")
 
 MODE_HELP = {
     "safe": "stage changes; undo freely; nothing is final until you commit",
@@ -31,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--duplicates", choices=dupes.LEVELS)
     p.add_argument("--keep", choices=dupes.KEEPS)
     p.add_argument("--apply-mode", choices=changes.APPLY_MODES)
+    p.add_argument("--destinations", metavar="SERVICES", help="where new playlists show up, e.g. qobuz,spotify")
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("import", help="import playlists from JSON, CSV or M3U files")
@@ -85,14 +89,12 @@ def main(argv: list[str] | None = None) -> int:
                            help="stage for commit, as in safe mode")
         group.add_argument("--dry-run", dest="mode", action="store_const", const="dry",
                            help="only show what would change")
-        return p
-
-    def backup_flags(p):
         group = p.add_mutually_exclusive_group()
         group.add_argument("--backup", action="store_true",
-                           help="if a deleted playlist isn't backed up yet, back up first without asking")
-        group.add_argument("--no-backup", action="store_true",
-                           help="delete even if there is no backup of the current version")
+                           help="if a backup is needed first (before deleting, or before writing to a "
+                                "service), make it without asking")
+        group.add_argument("--no-backup", action="store_true", help="go ahead without the backup")
+        return p
 
     p = change_parser("rename", "rename a playlist")
     p.add_argument("playlist", help="ID or name")
@@ -101,7 +103,6 @@ def main(argv: list[str] | None = None) -> int:
 
     p = change_parser("delete", "delete playlists (unfollow, for followed ones)")
     p.add_argument("playlists", nargs="*", help="IDs or names (or choose with filters)")
-    backup_flags(p)
     filter_flags(p)
     p.set_defaults(func=cmd_delete)
 
@@ -126,7 +127,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--duplicates", choices=dupes.LEVELS, help="override the duplicate setting")
     p.add_argument("--include-followed", action="store_true",
                    help="also match followed playlists when selecting by name")
-    backup_flags(p)
     p.set_defaults(func=cmd_merge)
 
     p = change_parser("merge-names", "merge every group of playlists that share a name (per service)")
@@ -135,7 +135,6 @@ def main(argv: list[str] | None = None) -> int:
                    help="which playlist of each group is kept (default: oldest)")
     p.add_argument("--keep-sources", action="store_true", help="don't delete the merged-in playlists")
     p.add_argument("--duplicates", choices=dupes.LEVELS, help="override the duplicate setting")
-    backup_flags(p)
     filter_flags(p)
     p.set_defaults(func=cmd_merge_names)
 
@@ -176,7 +175,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--min", type=int, default=1, metavar="N",
                    help="with --by: groups smaller than N go together into '<name> – other'")
     p.add_argument("--delete-original", action="store_true")
-    backup_flags(p)
     p.set_defaults(func=cmd_split)
 
     p = change_parser("clone", "copy a playlist")
@@ -208,6 +206,20 @@ def main(argv: list[str] | None = None) -> int:
     s.set_defaults(func=cmd_spotify_status)
     s = spotify_sub.add_parser("disconnect", help="delete the stored Spotify login")
     s.set_defaults(func=cmd_spotify_disconnect)
+    p = sub.add_parser("qobuz", help="connect to Qobuz (see docs/qobuz.md)")
+    qobuz_sub = p.add_subparsers(dest="qobuz_command", required=True)
+    q = qobuz_sub.add_parser("connect", help="sign in with a request copied from the Qobuz web player")
+    q.add_argument("--file", type=Path, help="read the copied request from a file instead of pasting it")
+    q.set_defaults(func=cmd_qobuz_connect)
+    q = qobuz_sub.add_parser("status", help="show whether Segue is connected to Qobuz")
+    q.set_defaults(func=cmd_qobuz_status)
+    q = qobuz_sub.add_parser("disconnect", help="delete the stored Qobuz session")
+    q.set_defaults(func=cmd_qobuz_disconnect)
+    q = qobuz_sub.add_parser("probe", help="test what Segue can read and change on Qobuz")
+    q.add_argument("--read-only", action="store_true", help="skip the tests that change playlists")
+    q.add_argument("--yes", action="store_true", help="run the change tests without asking")
+    q.set_defaults(func=cmd_qobuz_probe)
+
     s = spotify_sub.add_parser("probe", help="test what your Spotify app may read and change")
     s.add_argument("--read-only", action="store_true", help="skip the tests that change playlists")
     s.add_argument("--yes", action="store_true", help="run the change tests without asking")
@@ -224,8 +236,16 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("pending", help="show staged changes waiting for commit")
     p.set_defaults(func=cmd_pending)
 
-    p = sub.add_parser("commit", help="make all staged changes final")
+    p = sub.add_parser("commit", help="write staged changes to your services and make them final")
+    p.add_argument("--local", action="store_true", help="only make them final in Segue; write nothing to services")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--backup", action="store_true", help="if there's no backup since the last pull, make one first")
+    group.add_argument("--no-backup", action="store_true", help="write to services even without a backup")
     p.set_defaults(func=cmd_commit)
+
+    p = sub.add_parser("pull", help="read your library from a service into Segue")
+    p.add_argument("service", choices=["qobuz"])
+    p.set_defaults(func=cmd_pull)
 
     p = sub.add_parser("discard", help="throw away all staged changes")
     p.set_defaults(func=cmd_discard)
@@ -237,14 +257,20 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("undo", help="undo a change (default: the last one)")
     p.add_argument("batch", nargs="?", type=int)
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--backup", action="store_true", help="if a backup is needed before writing to a service, make it")
+    group.add_argument("--no-backup", action="store_true", help="go ahead without the backup")
     p.set_defaults(func=cmd_undo)
 
     p = sub.add_parser("redo", help="redo an undone change (default: the last one)")
     p.add_argument("batch", nargs="?", type=int)
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--backup", action="store_true", help="if a backup is needed before writing to a service, make it")
+    group.add_argument("--no-backup", action="store_true", help="go ahead without the backup")
     p.set_defaults(func=cmd_redo)
 
     p = sub.add_parser("config", help="show or change settings")
-    p.add_argument("key", nargs="?", choices=["apply-mode", "duplicates", "keep", "undo-limit"])
+    p.add_argument("key", nargs="?", choices=["apply-mode", "duplicates", "keep", "undo-limit", "destinations"])
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_config)
 
@@ -254,7 +280,8 @@ def main(argv: list[str] | None = None) -> int:
         with Store(db_path) as store:
             args.db_path = db_path
             return args.func(store, args) or 0
-    except (ValueError, KeyError, OSError, changes.ChangeError, spotify.SpotifyError) as e:
+    except (ValueError, KeyError, OSError, changes.ChangeError, spotify.SpotifyError, qobuz.QobuzError,
+            remote.RemoteError) as e:
         print(f"segue: {e.args[0] if isinstance(e, KeyError) else e}", file=sys.stderr)
         return 1
 
@@ -274,6 +301,13 @@ def cmd_setup(store: Store, args) -> int:
     if args.apply_mode or not flags:
         changes.set_apply_mode(store, args.apply_mode or _choose(
             "How should changes be applied?", MODE_HELP, changes.apply_mode(store)))
+    if args.destinations:
+        remote.set_destinations(store, args.destinations, SERVICES)
+    elif not flags:
+        current = ",".join(remote.destinations(store)) or "qobuz"
+        answer = input(f"Where should new playlists (from merges, splits, clones) show up?\n"
+                       f"  one or more of {', '.join(SERVICES)}, separated by commas [{current}]: ").strip()
+        remote.set_destinations(store, answer or current, SERVICES)
     return cmd_config(store, argparse.Namespace(key=None, value=None))
 
 
@@ -490,6 +524,82 @@ def cmd_check(store: Store, args) -> int:
     return 0
 
 
+# Qobuz
+
+def _qobuz_session(args) -> SecretFile:
+    return SecretFile(Path(args.db_path).parent / "qobuz.json")
+
+
+def cmd_qobuz_connect(store: Store, args) -> int:
+    if args.file:
+        raw = args.file.read_text(encoding="utf-8")
+    elif not sys.stdin.isatty():
+        raw = sys.stdin.read()
+    else:
+        print("In your browser, open play.qobuz.com and sign in. Open the developer tools (Network tab),\n"
+              "click any request to www.qobuz.com/api.json/0.2/…, and copy it (right-click → Copy → Copy as cURL).\n"
+              "Paste it here, then press Enter on an empty line. Only the X-App-Id and X-User-Auth-Token\n"
+              "headers are kept; cookies and everything else are thrown away.")
+        lines = []
+        while (line := input()) != "":
+            lines.append(line)
+        raw = "\n".join(lines)
+    session = qobuz.parse_session(raw)
+    client = qobuz.QobuzClient(session)
+    me = client.me()
+    client.playlists()  # proves the session can read the library
+    if not session.get("user_id") and me.get("id"):
+        session["user_id"] = str(me["id"])
+    _qobuz_session(args).save(session)
+    print(f"connected to Qobuz as {me.get('display_name') or me.get('login') or session.get('user_id')}. "
+          f"The session is stored in {_qobuz_session(args).path} (only you can read it).")
+    print("next: segue qobuz probe   then: segue pull qobuz")
+    return 0
+
+
+def cmd_qobuz_status(store: Store, args) -> int:
+    data = _qobuz_session(args).load()
+    if not data:
+        print("not connected. See docs/qobuz.md, then run: segue qobuz connect")
+        return 0
+    me = qobuz.QobuzClient(data).me()
+    print(f"connected to Qobuz as {me.get('display_name') or me.get('login') or me.get('id')}")
+    pulled = remote.last_pull(store, "qobuz")
+    print(f"last pull: {pulled[:16].replace('T', ' ')}" if pulled else "not pulled yet: segue pull qobuz")
+    return 0
+
+
+def cmd_qobuz_disconnect(store: Store, args) -> int:
+    if _qobuz_session(args).clear():
+        print("deleted the stored Qobuz session. Qobuz may keep the session itself valid until you "
+              "sign out of the web player.")
+    else:
+        print("not connected")
+    return 0
+
+
+def cmd_qobuz_probe(store: Store, args) -> int:
+    client = qobuz.QobuzClient(_qobuz_session(args))
+    write = _confirm_probe_writes(args, qobuz_probe.TEST_NAME)
+    marks = {"ok": "✓", "no": "✗", "skipped": "–", "error": "!"}
+    checks = qobuz_probe.probe(client, write, report=lambda c: print(f"{marks[c.result]} {c.name}: {c.detail}"))
+    print(qobuz_probe.summary(checks))
+    return 1 if any(c.result == "error" for c in checks) else 0
+
+
+def _confirm_probe_writes(args, test_name: str) -> bool:
+    if args.read_only:
+        return False
+    if args.yes:
+        return True
+    if not _interactive():
+        print("not in a terminal: running the read tests only (add --yes to include the change tests)")
+        return False
+    question = (f"The change tests create a private playlist {test_name!r} on your account "
+                "and delete it again at the end. Run them? [y/N] ")
+    return input(question).strip().lower() in ("y", "yes")
+
+
 # Spotify
 
 def _spotify_tokens(args) -> spotify.TokenStore:
@@ -536,15 +646,7 @@ def cmd_spotify_disconnect(store: Store, args) -> int:
 
 def cmd_spotify_probe(store: Store, args) -> int:
     client = spotify.SpotifyClient(_spotify_tokens(args))
-    write = not args.read_only
-    if write and not args.yes:
-        question = (f"The change tests create a private playlist {spotify_probe.TEST_NAME!r} on your account "
-                    "and delete it again at the end. Run them? [y/N] ")
-        if not _interactive():
-            print("not in a terminal: running the read tests only (add --yes to include the change tests)")
-            write = False
-        else:
-            write = input(question).strip().lower() in ("y", "yes")
+    write = _confirm_probe_writes(args, spotify_probe.TEST_NAME)
     marks = {"ok": "✓", "no": "✗", "skipped": "–", "error": "!"}
     checks = spotify_probe.probe(client, write, report=lambda c: print(f"{marks[c.result]} {c.name}: {c.detail}"))
     print(spotify_probe.summary(checks))
@@ -576,12 +678,14 @@ def _submit(store: Store, args, plan: edits.Plan) -> int:
         print("dry run: nothing changed")
         return 0
     _backup_gate(store, args, ops)
+    if (args.mode or changes.apply_mode(store)) == "auto":
+        _gate_linked_services(store, args)  # auto mode writes to services right away
     batch_id, status = changes.submit(store, description, ops, args.mode)
     if status == "staged":
         print(f"staged as #{batch_id}. Undo with: segue undo. Make it final with: segue commit")
-    else:
-        print(f"applied as #{batch_id}. Undo with: segue undo")
-    return 0
+        return 0
+    print(f"applied as #{batch_id}. Undo with: segue undo")
+    return 0 if _push(store, args) else 1
 
 
 def _backup_gate(store: Store, args, ops) -> None:
@@ -593,7 +697,25 @@ def _backup_gate(store: Store, args, ops) -> None:
     names = ", ".join(repr(store.playlist_state(pid).name) for pid in missing)
     last = backup.last_backup_time(store)
     since = f"The last backup is from {last[:10]}." if last else "You haven't made a backup yet."
-    message = f"{since} It doesn't include the current version of {names}."
+    _require_backup(store, args, f"{since} It doesn't include the current version of {names}.")
+
+
+def _service_backup_gate(store: Store, args, services: set[str]) -> None:
+    """Before the first write to a service after pulling from it, make sure there's a backup."""
+    last = backup.last_backup_time(store)
+    stale = [s for s in sorted(services) if (pulled := remote.last_pull(store, s)) and (not last or last < pulled)]
+    if stale:
+        names = ", ".join(s.capitalize() for s in stale)
+        _require_backup(store, args, f"There's no backup since you last pulled from {names}, "
+                                     "and this is about to change playlists there.")
+
+
+def _gate_linked_services(store: Store, args) -> None:
+    connected = set(_services(args))
+    _service_backup_gate(store, args, {svc for _, svc, _, _ in store.remote_links() if svc in connected})
+
+
+def _require_backup(store: Store, args, message: str) -> None:
     if getattr(args, "no_backup", False):
         print(f"warning: {message} Continuing without a backup (--no-backup).")
         return
@@ -630,22 +752,78 @@ def cmd_pending(store: Store, args) -> int:
         print(f"  #{batch.id}  {batch.description}")
         for line in changes.describe_batch(store, batch.id):
             print(f"        - {line}")
-    print("commit will write:")
+    print("net change:")
     for line in changes.describe_staged(store) or ["nothing (the staged changes cancel out)"]:
         print(f"  - {line}")
+    to_services = remote.describe_pending(store, _services(args))
+    if to_services:
+        print("commit will write:")
+        for line in to_services:
+            print(f"  - {line}")
     print("undo with: segue undo   make final with: segue commit   throw away with: segue discard")
     return 0
 
 
 def cmd_commit(store: Store, args) -> int:
-    ids = changes.commit(store)
-    if not ids:
-        print("nothing staged")
+    staged = changes.batches(store, ["staged"])
+    services = _services(args)
+    pending = [] if args.local else remote.pending_pushes(store, services)
+    if not staged and not pending:
+        print("nothing to commit")
         return 0
-    print(f"committed {len(ids)} change{'s' if len(ids) != 1 else ''} "
-          f"({', '.join(f'#{i}' for i in ids)}). They are final now and can't be undone.")
-    print("(no services are connected yet, so nothing was written to one)")
+    if pending and not _push(store, args):
+        print("The commit stopped. Your staged changes are still staged; what was already written is kept. "
+              "Fix the above and run segue commit again.")
+        return 1
+    ids = changes.commit(store)
+    if ids:
+        print(f"committed {len(ids)} change{'s' if len(ids) != 1 else ''} "
+              f"({', '.join(f'#{i}' for i in ids)}). They are final now and can't be undone.")
+    if args.local:
+        print("(--local: nothing was written to your services)")
     return 0
+
+
+def cmd_pull(store: Store, args) -> int:
+    service = _services(args).get(args.service)
+    if service is None:
+        raise ValueError(f"not connected to {args.service}; run: segue {args.service} connect")
+    print(f"reading your library from {service.display}…")
+    report = remote.pull(store, service)
+    print(f"pulled from {service.display}: {report.added} added, {report.updated} updated, "
+          f"{report.removed} removed, {report.unchanged} unchanged")
+    print("Before changing things there, back up with: segue backup")
+    return 0
+
+
+def _services(args) -> dict:
+    """The services Segue is connected to and can write to."""
+    found = {}
+    session = SecretFile(Path(args.db_path).parent / "qobuz.json")
+    if session.load():
+        found["qobuz"] = qobuz.QobuzService(qobuz.QobuzClient(session))
+    return found
+
+
+def _push(store: Store, args) -> bool:
+    """Write pending changes to services; print what happened. False if anything went wrong."""
+    services = _services(args)
+    targets = remote.pending_pushes(store, services)
+    if not targets:
+        return True
+    _service_backup_gate(store, args, {t.service for t in targets if t.service in services})
+    result = remote.push(store, services)
+    for name, where, notes in result.written:
+        print(f"  {where}: wrote {name!r}" + (f" ({'; '.join(notes)})" if notes else ""))
+    for line in result.skipped:
+        print(f"  skipped: {line}")
+    for line in result.unmatched:
+        print(f"  note: {line}")
+    for line in result.conflicts + result.errors:
+        print(f"  ! {line}")
+    if result.conflicts:
+        print("Nothing was written, because of the conflicts above.")
+    return result.ok
 
 
 def cmd_discard(store: Store, args) -> int:
@@ -667,15 +845,24 @@ def cmd_history(store: Store, args) -> int:
 
 
 def cmd_undo(store: Store, args) -> int:
+    target = args.batch or changes.next_undo(store)
+    if target and changes.get_batch(store, target).mode != "safe":
+        _gate_linked_services(store, args)  # undoing an applied change writes to the service
     batch_id = changes.undo(store, args.batch)
-    print(f"undid #{batch_id}  {changes.get_batch(store, batch_id).description}  (redo with: segue redo)")
-    return 0
+    batch = changes.get_batch(store, batch_id)
+    print(f"undid #{batch_id}  {batch.description}  (redo with: segue redo)")
+    # An undone auto-mode change was already on the service: put the service back too.
+    return 0 if batch.mode == "safe" or _push(store, args) else 1
 
 
 def cmd_redo(store: Store, args) -> int:
+    target = args.batch or changes.next_redo(store)
+    if target and changes.get_batch(store, target).mode != "safe":
+        _gate_linked_services(store, args)
     batch_id = changes.redo(store, args.batch)
-    print(f"redid #{batch_id}  {changes.get_batch(store, batch_id).description}")
-    return 0
+    batch = changes.get_batch(store, batch_id)
+    print(f"redid #{batch_id}  {batch.description}")
+    return 0 if batch.mode == "safe" or _push(store, args) else 1
 
 
 def cmd_config(store: Store, args) -> int:
@@ -684,6 +871,8 @@ def cmd_config(store: Store, args) -> int:
         "duplicates": (dupes.level, dupes.set_level),
         "keep": (dupes.keep, dupes.set_keep),
         "undo-limit": (changes.undo_limit, changes.set_undo_limit),
+        "destinations": (lambda st: ",".join(remote.destinations(st)) or "(none yet)",
+                         lambda st, value: remote.set_destinations(st, value, SERVICES)),
     }
     if args.key is None:
         for key, (get, _) in getters.items():

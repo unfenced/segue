@@ -13,19 +13,12 @@ playlist, which it deletes again at the end, even when a step fails:
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
 
+from .common import Check
 from .spotify import SpotifyClient, SpotifyError
 
 TEST_NAME = "Segue test (safe to delete)"
 TEST_DESCRIPTION = "Made by 'segue spotify probe' to test what Segue can do. Delete it if it's still here."
-
-
-@dataclass
-class Check:
-    name: str
-    result: str  # ok | no | skipped | error
-    detail: str
 
 
 def _track(item: dict) -> dict:
