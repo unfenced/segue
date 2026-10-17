@@ -2,8 +2,8 @@
 
 Segue writes these columns:
 
-    playlist, playlist_description, playlist_service, playlist_id, playlist_url,
-    position, title, artists, album, duration_ms, isrc, added_at,
+    playlist, playlist_description, playlist_kind, playlist_service, playlist_id, playlist_url,
+    segue_id, position, title, artists, album, duration_ms, isrc, added_at,
     <service>_id, <service>_url   (one pair per service that appears, e.g. spotify_id)
 
 Artists are separated by "; ". A playlist with no tracks is written as a single row with
@@ -20,20 +20,22 @@ import csv
 import re
 from pathlib import Path
 
-from ..model import Playlist, PlaylistEntry, ServiceRef, Track
+from ..model import KINDS, Playlist, PlaylistEntry, ServiceRef, Track
 from ..services import parse_track_link, track_url
 
 ARTIST_SEPARATOR = "; "
 
 _FIXED_COLUMNS = [
-    "playlist", "playlist_description", "playlist_service", "playlist_id", "playlist_url",
-    "position", "title", "artists", "album", "duration_ms", "isrc", "added_at",
+    "playlist", "playlist_description", "playlist_kind", "playlist_service", "playlist_id",
+    "playlist_url", "segue_id", "position", "title", "artists", "album", "duration_ms", "isrc", "added_at",
 ]
 
 # Accepted header spellings (after lower-casing and trimming) for each field.
 _ALIASES = {
     "playlist": {"playlist", "playlist name", "playlist_name"},
     "playlist_description": {"playlist_description", "playlist description", "description"},
+    "playlist_kind": {"playlist_kind", "playlist kind"},
+    "segue_id": {"segue_id"},
     "playlist_service": {"playlist_service"},
     "playlist_id": {"playlist_id", "playlist id"},
     "playlist_url": {"playlist_url", "playlist url"},
@@ -51,7 +53,7 @@ _ALIASES = {
 _SERVICE_COLUMN = re.compile(r"^([a-z0-9]+)_(id|url)$")
 
 
-def write(playlists: list[Playlist], path: Path) -> None:
+def write(playlists: list[Playlist], path: Path, library_id: str | None = None) -> None:
     services = sorted({r.service for p in playlists for t in p.tracks for r in t.refs})
     columns = _FIXED_COLUMNS + [f"{s}_{kind}" for s in services for kind in ("id", "url")]
     # utf-8-sig so Excel shows accents and non-Latin titles correctly.
@@ -62,6 +64,8 @@ def write(playlists: list[Playlist], path: Path) -> None:
             base = {
                 "playlist": p.name,
                 "playlist_description": p.description or "",
+                "playlist_kind": p.kind,
+                "segue_id": f"{library_id}/{p.id}" if library_id and p.id is not None else "",
                 "playlist_service": p.source.service if p.source else "",
                 "playlist_id": p.source.id if p.source else "",
                 "playlist_url": (p.source.url or "") if p.source else "",
@@ -160,10 +164,20 @@ def _row_values(raw: list[str], fields: dict[int, str]) -> dict[str, str]:
 def _playlist_for(row: dict[str, str], path: Path, playlists: dict[tuple, Playlist]):
     name = row.get("playlist") or path.stem
     service, pid = row.get("playlist_service") or None, row.get("playlist_id") or None
-    key = (name, service, pid) if not (service and pid) else (service, pid)
+    segue_id = row.get("segue_id") or None
+    if segue_id:
+        key = ("segue", segue_id)
+    elif service and pid:
+        key = (service, pid)
+    else:
+        key = (name, service, pid)
     if key not in playlists:
         source = ServiceRef(service, pid, row.get("playlist_url") or None) if service and pid else None
-        playlists[key] = Playlist(name, description=row.get("playlist_description") or None, source=source)
+        kind = row.get("playlist_kind")
+        playlists[key] = Playlist(
+            name, description=row.get("playlist_description") or None, source=source,
+            kind=kind if kind in KINDS else "created", segue_id=segue_id,
+        )
     return key, playlists[key]
 
 

@@ -6,54 +6,64 @@ so switching away from Spotify (or any other service) takes minutes, not weekend
 
 ## Status
 
-Steps 1 and 2 are done (see the build order below):
+Steps 1–3 are done (see the build order below):
 
 - the neutral track library, the SQLite store, and JSON/CSV/M3U import and export;
-- the change log, with commit or auto mode, undo and redo.
+- the change log, with safe mode (staged, undo until commit) and auto mode (applied at once,
+  recent changes undoable);
+- backups that Segue keeps track of, a backup check before anything deletes playlists, and
+  restoring from a CSV or JSON backup;
+- the duplicate setting (exact, same recording, same song in any version);
+- playlist kinds: created, collaborative, followed and Liked songs.
 
 There are no service connectors yet, so changes apply to Segue's own library. You can
 already import playlist exports from other tools, such as [Exportify](https://exportify.net)
 CSVs for Spotify, and clean them up.
 
 ```bash
+uv run segue setup                              # what counts as a duplicate, safe or auto mode
 uv run segue import "Liked Songs.csv" road-trip.m3u8 backup.json
 uv run segue list
 uv run segue show "road trip"
 uv run segue export everything.csv              # or .json; a folder name → one .m3u8 per playlist
-uv run segue export chill.m3u8 -p Chill --prefer spotify
 uv run segue backup                             # timestamped JSON + CSV next to the library
 
-uv run segue dedupe "road trip"                 # plans a change: queued in commit mode
-uv run segue merge Chill "Chill 2" --into Chill --delete-sources
+uv run segue dedupe "road trip"                 # uses the duplicate setting; or --duplicates song
+uv run segue merge "Gym 2" --into Gym --delete-sources   # checks for a backup first
 uv run segue merge A B C --new "Everything" --dry-run
 uv run segue rename 3 "Gym"
 uv run segue delete Old
 uv run segue remove Gym 4 7                     # positions as shown by: segue show Gym
-uv run segue pending                            # review what's queued
-uv run segue commit                             # apply it (or: segue discard)
-uv run segue history
+uv run segue pending                            # staged changes, and what commit will write
 uv run segue undo                               # last change; or: segue undo 12
 uv run segue redo
-uv run segue config apply-mode auto             # or commit (default); --now / --queue per command
+uv run segue commit                             # final: no undo after this (or: segue discard)
+uv run segue restore ~/.segue/backups/segue-backup-2026-10-17_120000.csv -p Gym
+uv run segue history
+uv run segue config                             # apply-mode, duplicates, keep, undo-limit
 uv run pytest
 ```
+
+Commands that change playlists take `--now` (apply right away), `--stage` (stage for commit)
+or `--dry-run` (only show the preview). Commands that select playlists by name skip followed
+playlists unless you add `--include-followed`.
 
 The library lives at `~/.segue/segue.db`; override it with `--db` or `SEGUE_DB`.
 
 | Format | Use it for | Keeps |
 |---|---|---|
-| JSON | Backups and restores | Everything: all service IDs per track, ISRC, added dates, playlist source |
-| CSV | Spreadsheets, and imports from other tools | One ID per service per row; reads Exportify-style and semicolon (Dutch Excel) files |
+| JSON | Backups and restores | Everything: all service IDs per track, ISRC, added dates, playlist source and kind |
+| CSV | Backups you can open in a spreadsheet; imports from other tools | One ID per service per row; reads Exportify-style and semicolon (Dutch Excel) files |
 | M3U8 | Media players | Title, artists, length, album and one link or file path; tracks without either are left out |
 
-Importing is safe to repeat. A playlist with a service ID replaces its earlier copy, and an
-identical playlist is skipped instead of duplicated. Imports only touch Segue's own library,
-so they apply right away in either mode, but they are logged: an import that replaced a
-playlist can be undone.
+Both backup files carry each playlist's Segue ID, so `segue restore` puts playlists back in
+place, including ones deleted since the backup. A backup from another Segue library is
+restored as new playlists and never overwrites existing ones.
 
-How changes work today: in commit mode a change waits in a queue until `segue commit`, and
-undo also works after a commit. Step 3 changes this to the staged model described in the spec:
-changes show up right away, undo works only until you commit, and commit is final.
+Importing is safe to repeat. A playlist with a service ID replaces its earlier copy, and an
+identical playlist is skipped instead of duplicated. Imports bring data into Segue rather
+than change a service, so they apply right away in either mode and can be undone like
+recent auto-mode changes.
 
 ## What Segue will do
 
@@ -67,8 +77,9 @@ The full feature spec, with open questions, is in **[docs/spec.md](docs/spec.md)
 3. **Never lose anything.** A CSV/JSON backup is required before the first change to a
    service, and Segue asks for a fresh one before anything that deletes playlists. Backups
    can be uploaded again to restore.
-4. **Safe mode by default.** Changes are staged, so you can undo and redo until you commit.
-   Auto mode writes each change right away.
+4. **Safe mode by default.** Changes are staged, so you can undo and redo until you commit,
+   and a commit is final. Auto mode writes each change right away, and the last 20 can still
+   be undone.
 5. **Your playlists vs. followed ones**, and **Liked songs** as one collection everywhere,
    translated per service (a collection on Spotify, a favorite tag on Qobuz).
 6. **Later: transfers and sync rules.** Copy and sync across services, with deletions
@@ -136,10 +147,13 @@ Every connector declares **how** it connects and **what** the connection allows:
   sync rules and the operation log.
 - **Engine**: matching, dedupe, merge, diff and sync planning. Produces planned operations;
   never writes to a service directly.
-- **Change log** (`changes.py`): applies planned operations (commit or auto mode) and
-  records before/after snapshots for undo and redo. Locally a batch is all-or-nothing. With
-  services it will also need to handle rate limits and partial failures (resume, or roll back
-  the part that was written).
+- **Change log** (`changes.py`): applies operations right away and records before/after
+  snapshots for undo and redo. In safe mode, the snapshots before the first staged change are
+  also the "last committed" state, so the net difference is exactly what a commit will write
+  to a service. Locally a batch is all-or-nothing. With services, commit will also need to
+  handle rate limits and partial failures (resume, or roll back the part that was written).
+- **Backups** (`backup.py`): writes backups, records which version of each playlist they
+  hold, and plans restores.
 - **Interface**: start with a CLI, then a local web UI.
 
 ## Build order (working plan)
@@ -148,7 +162,7 @@ Organizing comes first; transfers and sync come after.
 
 1. ✅ Neutral model + SQLite store + CSV/JSON/M3U import/export (this is also the backup).
 2. ✅ Planned operations, operation log and undo, applied to Segue's own library.
-3. **Safety rework:** staged changes with undo until commit, commit as the final step, and
+3. ✅ **Safety rework:** staged changes with undo until commit, commit as the final step, and
    backup tracking with a prompt before deletes. Also restore from a backup, the
    duplicate-definition setting (asked on first run), and followed/owned playlists plus Liked
    songs in the model.

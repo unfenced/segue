@@ -7,6 +7,7 @@ snapshots the states before and after, and uses those snapshots to undo and redo
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import ClassVar
@@ -43,6 +44,8 @@ class Operation:
         for name, value in vars(self).items():
             if name == "entries":
                 value = [e.to_dict() for e in value]
+            elif isinstance(value, PlaylistState):
+                value = value.to_dict()
             elif isinstance(value, tuple):
                 value = list(value)
             data[name] = value
@@ -54,6 +57,8 @@ class Operation:
         cls = Operation._registry[data.pop("kind")]
         if "entries" in data:
             data["entries"] = tuple(EntryState.from_dict(e) for e in data["entries"])
+        if "state" in data:
+            data["state"] = PlaylistState.from_dict(data["state"])
         for name in ("positions", "order"):
             if name in data:
                 data[name] = tuple(data[name])
@@ -64,6 +69,40 @@ def _require(state: PlaylistState | None, op: Operation) -> PlaylistState:
     if state is None:
         raise ValueError(f"{op.kind}: playlist {op.target} doesn't exist")
     return state
+
+
+def _require_tracks_editable(state: PlaylistState | None, op: Operation) -> PlaylistState:
+    state = _require(state, op)
+    if state.kind == "followed":
+        raise ValueError(f"{state.name!r} is a followed playlist; copy it to change its tracks")
+    return state
+
+
+def describe_change(before: PlaylistState | None, after: PlaylistState | None, track: Describer) -> str:
+    """A one-line summary of how a playlist differs between two states."""
+    if before is None and after is None:
+        return "no change"
+    if before is None:
+        return f"create {after.name!r} with {_tracks(len(after.entries))}"
+    if after is None:
+        verb = "unfollow" if before.kind == "followed" else "delete"
+        return f"{verb} {before.name!r} ({_tracks(len(before.entries))})"
+    parts = []
+    if before.name != after.name:
+        parts.append(f"renamed from {before.name!r}")
+    if before.description != after.description:
+        parts.append("description changed")
+    old, new = Counter(before.track_ids), Counter(after.track_ids)
+    added, removed = sum((new - old).values()), sum((old - new).values())
+    if added:
+        parts.append(f"+{_tracks(added)}")
+    if removed:
+        parts.append(f"-{_tracks(removed)}")
+    if not added and not removed and before.track_ids != after.track_ids:
+        parts.append("reordered")
+    if not parts and before != after:
+        parts.append("details changed")
+    return f"{after.name!r}: " + (", ".join(parts) if parts else "no change")
 
 
 def _titles(entries, track: Describer) -> str:
@@ -102,13 +141,16 @@ class DeletePlaylist(Operation):
     playlist_id: int
 
     def apply(self, state):
-        _require(state, self)
+        state = _require(state, self)
+        if state.kind == "liked":
+            raise ValueError("Liked songs can't be deleted")
         return None
 
     def describe(self, state, track):
         if state is None:
             return f"delete playlist {self.playlist_id} (already gone)"
-        return f"delete {state.name!r} ({_tracks(len(state.entries))})"
+        verb = "unfollow" if state.kind == "followed" else "delete"
+        return f"{verb} {state.name!r} ({_tracks(len(state.entries))})"
 
 
 @dataclass(frozen=True)
@@ -120,6 +162,8 @@ class EditPlaylist(Operation):
 
     def apply(self, state):
         state = _require(state, self)
+        if state.kind in ("followed", "liked"):
+            raise ValueError(f"{state.name!r} can't be renamed: it's a {state.kind} playlist")
         return replace(
             state,
             name=state.name if self.name is None else self.name,
@@ -144,10 +188,15 @@ class AddEntries(Operation):
     position: int | None = None  # None appends
 
     def apply(self, state):
-        state = _require(state, self)
+        state = _require_tracks_editable(state, self)
         current = list(state.entries)
+        new = list(self.entries)
+        if state.kind == "liked":
+            # Liked songs is a set: liking a track twice does nothing.
+            seen = set(state.track_ids)
+            new = [e for e in new if not (e.track_id in seen or seen.add(e.track_id))]
         at = len(current) if self.position is None else max(0, min(self.position, len(current)))
-        return replace(state, entries=tuple(current[:at] + list(self.entries) + current[at:]))
+        return replace(state, entries=tuple(current[:at] + new + current[at:]))
 
     def describe(self, state, track):
         name = state.name if state else f"playlist {self.playlist_id}"
@@ -161,7 +210,7 @@ class RemovePositions(Operation):
     positions: tuple[int, ...]  # 0-based, in the state the batch was planned on
 
     def apply(self, state):
-        state = _require(state, self)
+        state = _require_tracks_editable(state, self)
         drop = set(self.positions)
         if any(p < 0 or p >= len(state.entries) for p in drop):
             raise ValueError(f"remove: position out of range for {state.name!r}")
@@ -181,7 +230,7 @@ class Reorder(Operation):
     order: tuple[int, ...]  # current positions, listed in their new order
 
     def apply(self, state):
-        state = _require(state, self)
+        state = _require_tracks_editable(state, self)
         if sorted(self.order) != list(range(len(state.entries))):
             raise ValueError(f"reorder: not a full reordering of {state.name!r}")
         return replace(state, entries=tuple(state.entries[i] for i in self.order))
@@ -190,3 +239,26 @@ class Reorder(Operation):
         moved = sum(1 for new, old in enumerate(self.order) if new != old)
         name = state.name if state else f"playlist {self.playlist_id}"
         return f"reorder {name!r} ({_tracks(moved)} move)"
+
+
+@dataclass(frozen=True)
+class RestorePlaylist(Operation):
+    """Make a playlist exactly ``state``: recreate it if it was deleted, or add it as new."""
+
+    kind: ClassVar[str] = "restore"
+    playlist_id: int | None  # None: add as a new playlist
+    state: PlaylistState
+
+    @property
+    def target(self) -> int | None:
+        return self.playlist_id
+
+    def apply(self, current):
+        return self.state
+
+    def describe(self, current, track):
+        if self.playlist_id is None:
+            return f"add {self.state.name!r} as a new playlist ({_tracks(len(self.state.entries))})"
+        if current is None:
+            return f"recreate {self.state.name!r} ({_tracks(len(self.state.entries))})"
+        return "restore " + describe_change(current, self.state, track)

@@ -44,6 +44,12 @@ class PlaylistEntry:
     added_at: str | None = None  # ISO 8601, as given by the source
 
 
+# How a playlist relates to its owner on the service.
+#   created: made by you; collaborative: you can edit, others too;
+#   followed: someone else's, read-only; liked: the service's Liked songs / favorites.
+KINDS = ("created", "collaborative", "followed", "liked")
+
+
 @dataclass
 class Playlist:
     name: str
@@ -52,6 +58,9 @@ class Playlist:
     # Identity on the source service. Playlists without one are always imported as new.
     source: ServiceRef | None = None
     id: int | None = None
+    kind: str = "created"
+    # "<library id>/<playlist id>" from a Segue backup, used to restore into the same library.
+    segue_id: str | None = None
 
     @property
     def tracks(self) -> list[Track]:
@@ -106,6 +115,7 @@ class PlaylistState:
     description: str | None = None
     source: ServiceRef | None = None
     entries: tuple[EntryState, ...] = ()
+    kind: str = "created"
 
     @property
     def track_ids(self) -> list[int]:
@@ -117,6 +127,7 @@ class PlaylistState:
             "name": self.name,
             "description": self.description,
             "source": {"service": src.service, "id": src.id, "url": src.url} if src else None,
+            "kind": self.kind,
             "entries": [e.to_dict() for e in self.entries],
         }
 
@@ -128,4 +139,5 @@ class PlaylistState:
             description=data.get("description"),
             source=ServiceRef(src["service"], src["id"], src.get("url")) if src else None,
             entries=tuple(EntryState.from_dict(e) for e in data.get("entries", [])),
+            kind=data.get("kind", "created"),
         )

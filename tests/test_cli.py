@@ -6,6 +6,14 @@ def run(tmp_path, *args):
     return main(["--db", str(tmp_path / "segue.db"), *args])
 
 
+def load(tmp_path, sample_playlists, capsys):
+    source = tmp_path / "in.json"
+    json_format.write(sample_playlists, source)
+    run(tmp_path, "import", str(source))
+    capsys.readouterr()
+    return source
+
+
 def test_import_list_show_export_backup(tmp_path, sample_playlists, capsys):
     source = tmp_path / "in.json"
     json_format.write(sample_playlists, source)
@@ -48,49 +56,87 @@ def test_unknown_playlist_is_an_error(tmp_path, capsys):
 
 
 def test_single_m3u_needs_one_playlist(tmp_path, sample_playlists, capsys):
-    source = tmp_path / "in.json"
-    json_format.write(sample_playlists, source)
-    run(tmp_path, "import", str(source))
+    load(tmp_path, sample_playlists, capsys)
     assert run(tmp_path, "export", str(tmp_path / "all.m3u8")) == 1
     assert run(tmp_path, "export", str(tmp_path / "chill.m3u8"), "-p", "Chill") == 0
 
 
-def test_change_commands_queue_commit_undo(tmp_path, sample_playlists, capsys):
-    source = tmp_path / "in.json"
-    json_format.write(sample_playlists, source)
-    run(tmp_path, "import", str(source))
-    capsys.readouterr()
+def test_stage_undo_commit(tmp_path, sample_playlists, capsys):
+    load(tmp_path, sample_playlists, capsys)
+    assert run(tmp_path, "merge", "Road trip", "--into", "Chill", "--duplicates", "recording") == 0
+    assert "staged as #" in capsys.readouterr().out
 
-    assert run(tmp_path, "merge", "Chill", "Empty one", "--into", "Road trip", "--delete-sources") == 0
-    out = capsys.readouterr().out
-    assert "delete 'Chill' (2 tracks)" in out and "queued as #" in out
-
+    run(tmp_path, "rename", "Chill", "Everything")
     run(tmp_path, "pending")
-    assert "merge 'Chill', 'Empty one' into 'Road trip'" in capsys.readouterr().out
-
-    run(tmp_path, "commit")
-    assert "applied #" in capsys.readouterr().out
-    run(tmp_path, "list")
     out = capsys.readouterr().out
-    assert "Chill" not in out and "Road trip" in out
+    assert "commit will write:" in out and "'Everything': renamed from 'Chill', +1 track" in out
 
     run(tmp_path, "undo")
     run(tmp_path, "list")
     assert "Chill" in capsys.readouterr().out
 
-    run(tmp_path, "history")
+    run(tmp_path, "commit")
+    assert "final now" in capsys.readouterr().out
+    assert run(tmp_path, "undo") == 1
+    assert "restore a backup" in capsys.readouterr().err
+
+
+def test_delete_asks_for_a_backup_first(tmp_path, sample_playlists, capsys):
+    load(tmp_path, sample_playlists, capsys)
+    assert run(tmp_path, "delete", "Chill") == 1
+    assert "--backup to make one first" in capsys.readouterr().err
+
+    assert run(tmp_path, "delete", "Chill", "--backup") == 0
     out = capsys.readouterr().out
-    assert "undone" in out and "import 'Road trip' from in.json" in out
+    assert "backed up to" in out and "staged as #" in out
+
+    # The merge with --delete-sources needs a backup of the current version too.
+    run(tmp_path, "rename", "Empty one", "Empty")
+    assert run(tmp_path, "merge", "Empty", "--into", "Road trip", "--delete-sources",
+               "--duplicates", "recording") == 1
+    assert run(tmp_path, "merge", "Empty", "--into", "Road trip", "--delete-sources",
+               "--duplicates", "recording", "--no-backup") == 0
+    assert "warning:" in capsys.readouterr().out
 
 
-def test_dry_run_and_now(tmp_path, sample_playlists, capsys):
-    source = tmp_path / "in.json"
-    json_format.write(sample_playlists, source)
-    run(tmp_path, "import", str(source))
+def test_restore_command(tmp_path, sample_playlists, capsys):
+    load(tmp_path, sample_playlists, capsys)
+    run(tmp_path, "backup", str(tmp_path / "bk"))
+    run(tmp_path, "delete", "Chill", "--now")
+    capsys.readouterr()
+    backup_file = next((tmp_path / "bk").glob("*.csv"))
+    assert run(tmp_path, "restore", str(backup_file), "-p", "chill") == 0
+    assert "recreate 'Chill' (2 tracks)" in capsys.readouterr().out
+    run(tmp_path, "list")
+    assert "Chill" in capsys.readouterr().out
+
+
+def test_dry_run_auto_mode_and_config(tmp_path, sample_playlists, capsys):
+    load(tmp_path, sample_playlists, capsys)
     run(tmp_path, "rename", "Chill", "Calm", "--dry-run")
     assert "dry run" in capsys.readouterr().out
-    run(tmp_path, "rename", "Chill", "Calm", "--now")
-    assert "applied as #" in capsys.readouterr().out
     run(tmp_path, "config", "apply-mode", "auto")
-    run(tmp_path, "delete", "Calm")
+    run(tmp_path, "rename", "Chill", "Calm")
     assert "applied as #" in capsys.readouterr().out
+    run(tmp_path, "undo")
+    assert "undid" in capsys.readouterr().out
+    run(tmp_path, "setup", "--duplicates", "song", "--keep", "earliest")
+    out = capsys.readouterr().out
+    assert "duplicates = song" in out and "keep = earliest" in out and "apply-mode = auto" in out
+
+
+def test_followed_playlists_are_skipped_by_name(tmp_path, capsys):
+    from segue.model import Playlist, PlaylistEntry
+    from .conftest import make_track
+
+    source = tmp_path / "in.json"
+    json_format.write([
+        Playlist("Gym", [PlaylistEntry(make_track("A"))]),
+        Playlist("Gym", [PlaylistEntry(make_track("B"))], kind="followed"),
+    ], source)
+    run(tmp_path, "import", str(source))
+    capsys.readouterr()
+    run(tmp_path, "dedupe", "gym", "--duplicates", "recording")
+    assert "skipping followed playlist 'Gym'" in capsys.readouterr().out
+    run(tmp_path, "list")
+    assert "followed" in capsys.readouterr().out

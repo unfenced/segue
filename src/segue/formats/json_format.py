@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import __version__
-from ..model import Playlist, PlaylistEntry, ServiceRef, Track
+from ..model import KINDS, Playlist, PlaylistEntry, ServiceRef, Track
 
 FORMAT_NAME = "segue-playlists"
 FORMAT_VERSION = 1
@@ -24,7 +24,7 @@ def _ref_from_dict(data: dict) -> ServiceRef:
     return ServiceRef(str(data["service"]), str(data["id"]), data.get("url"))
 
 
-def to_dict(playlists: list[Playlist]) -> dict:
+def to_dict(playlists: list[Playlist], library_id: str | None = None) -> dict:
     return {
         "format": FORMAT_NAME,
         "version": FORMAT_VERSION,
@@ -34,7 +34,9 @@ def to_dict(playlists: list[Playlist]) -> dict:
             {
                 "name": p.name,
                 "description": p.description,
+                "kind": p.kind,
                 "source": _ref_to_dict(p.source) if p.source else None,
+                "segue_id": f"{library_id}/{p.id}" if library_id and p.id is not None else None,
                 "tracks": [
                     {
                         "title": e.track.title,
@@ -75,12 +77,18 @@ def from_dict(data: dict) -> list[Playlist]:
             for t in p.get("tracks", [])
         ]
         source = _ref_from_dict(p["source"]) if p.get("source") else None
-        playlists.append(Playlist(p["name"], entries, p.get("description"), source))
+        playlists.append(Playlist(p["name"], entries, p.get("description"), source,
+                                  kind=_kind(p.get("kind")), segue_id=p.get("segue_id")))
     return playlists
 
 
-def write(playlists: list[Playlist], path: Path) -> None:
-    path.write_text(json.dumps(to_dict(playlists), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+def write(playlists: list[Playlist], path: Path, library_id: str | None = None) -> None:
+    text = json.dumps(to_dict(playlists, library_id), indent=2, ensure_ascii=False)
+    path.write_text(text + "\n", encoding="utf-8")
+
+
+def _kind(value: str | None) -> str:
+    return value if value in KINDS else "created"
 
 
 def read(path: Path) -> list[Playlist]:

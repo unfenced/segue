@@ -1,12 +1,16 @@
-"""The change log: plan, commit, undo and redo batches of operations.
+"""The change log: apply, undo, redo and commit batches of operations.
 
-Every applied operation stores its playlist's state before and after. Undo writes the
-"before" state back, but only if the playlist still looks exactly like "after"; redo does
-the reverse. That check is what keeps an undo from silently overwriting later changes.
+A batch is one user action (a merge, a dedupe, ...). It changes Segue's library as soon as
+it's made, and every operation stores its playlist's state before and after.
 
-In **commit** mode (the default) planned batches wait in a queue for review. Each batch
-remembers the revision of every playlist it touches when it was planned; committing a
-batch whose playlists have changed since is refused as stale.
+- **Safe mode** (default): the batch is *staged*. Undo and redo step through staged batches;
+  ``commit`` makes them final, and after that they can't be undone (restore a backup instead).
+  Once services are connected, commit is when changes are written to them.
+- **Auto mode**: the batch is committed right away, but the most recent ones (``undo-limit``,
+  default 20) can still be undone.
+
+Undo writes the "before" state back only if the playlist still looks exactly like "after",
+so an undo never silently overwrites a later change. Making a new change clears the redo list.
 """
 
 from __future__ import annotations
@@ -16,11 +20,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .model import Playlist, PlaylistState
-from .ops import Operation
+from .ops import Operation, describe_change
 from .store import Store
 
-APPLY_MODES = ("commit", "auto")
-DEFAULT_APPLY_MODE = "commit"
+APPLY_MODES = ("safe", "auto")
+DEFAULT_APPLY_MODE = "safe"
+DEFAULT_UNDO_LIMIT = 20
 
 
 class ChangeError(Exception):
@@ -31,10 +36,14 @@ class ChangeError(Exception):
 class Batch:
     id: int
     description: str
-    status: str
+    status: str  # staged | committed | undone | discarded
+    mode: str  # safe | auto | import
     created_at: str
     applied_at: str | None
     undone_at: str | None
+
+
+_BATCH_COLUMNS = "id, description, status, mode, created_at, applied_at, undone_at"
 
 
 def _now() -> str:
@@ -49,6 +58,8 @@ def _load(text: str | None) -> PlaylistState | None:
     return None if text is None else PlaylistState.from_dict(json.loads(text))
 
 
+# Settings
+
 def apply_mode(store: Store) -> str:
     return store.get_setting("apply_mode", DEFAULT_APPLY_MODE)
 
@@ -59,7 +70,21 @@ def set_apply_mode(store: Store, mode: str) -> None:
     store.set_setting("apply_mode", mode)
 
 
-# Planning and previews
+def undo_limit(store: Store) -> int:
+    return int(store.get_setting("undo_limit", str(DEFAULT_UNDO_LIMIT)))
+
+
+def set_undo_limit(store: Store, value: str | int) -> None:
+    try:
+        limit = int(value)
+    except ValueError:
+        raise ValueError("undo-limit must be a whole number") from None
+    if limit < 0:
+        raise ValueError("undo-limit can't be negative")
+    store.set_setting("undo_limit", str(limit))
+
+
+# Previews
 
 def track_label(store: Store):
     cache: dict[int, str] = {}
@@ -84,131 +109,87 @@ def preview(store: Store, ops: list[Operation]) -> list[str]:
             states[target] = store.playlist_state(target)
         before = states.get(target) if target is not None else None
         lines.append(op.describe(before, label))
-        if target is not None:
-            try:
-                states[target] = op.apply(before)
-            except ValueError as e:
-                lines[-1] += f"  [will fail: {e}]"
+        try:
+            after = op.apply(before)
+            if target is not None:
+                states[target] = after
+        except ValueError as e:
+            lines[-1] += f"  [will fail: {e}]"
     return lines
 
 
-def plan(store: Store, description: str, ops: list[Operation]) -> int:
-    """Queue ops as a pending batch and return its ID."""
+def describe_batch(store: Store, batch_id: int) -> list[str]:
+    """What a batch did, from the snapshots it recorded."""
+    label = track_label(store)
+    lines = []
+    for row in _op_rows(store, batch_id):
+        data = json.loads(row["op"])
+        if data["kind"] == "import":
+            lines.append(describe_change(_load(row["before"]), _load(row["after"]), label))
+        else:
+            lines.append(Operation.from_dict(data).describe(_load(row["before"]), label))
+    return lines
+
+
+def staged_changes(store: Store) -> list[tuple[int, PlaylistState | None, PlaylistState | None]]:
+    """The net effect of everything staged: ``(playlist_id, committed, current)`` per playlist.
+
+    This is what a commit will write once services are connected.
+    """
+    base: dict[int, PlaylistState | None] = {}
+    for row in store.db.execute(
+        "SELECT o.playlist_id, o.before FROM operations o JOIN batches b ON b.id = o.batch_id"
+        " WHERE b.status = 'staged' ORDER BY b.changed_seq, o.seq"
+    ):
+        base.setdefault(row["playlist_id"], _load(row["before"]))
+    result = []
+    for pid, committed in base.items():
+        current = store.playlist_state(pid)
+        if current != committed:
+            result.append((pid, committed, current))
+    return result
+
+
+def describe_staged(store: Store) -> list[str]:
+    label = track_label(store)
+    return [describe_change(old, new, label) for _, old, new in staged_changes(store)]
+
+
+# Applying
+
+def submit(store: Store, description: str, ops: list[Operation], mode: str | None = None) -> tuple[int, str]:
+    """Apply a batch now. Returns ``(batch_id, status)``: "staged" (safe) or "committed" (auto)."""
     if not ops:
         raise ValueError("nothing to do")
-    with store.transaction():
-        expected = {
-            str(op.target): store.revision(op.target) for op in ops if op.target is not None
-        }
-        cur = store.db.execute(
-            "INSERT INTO batches (description, status, expected, created_at) VALUES (?, 'pending', ?, ?)",
-            (description, json.dumps(expected), _now()),
-        )
-        batch_id = cur.lastrowid
-        store.db.executemany(
-            "INSERT INTO operations (batch_id, seq, op) VALUES (?, ?, ?)",
-            [(batch_id, seq, json.dumps(op.to_dict())) for seq, op in enumerate(ops)],
-        )
-    return batch_id
-
-
-def submit(store: Store, description: str, ops: list[Operation], mode: str | None = None) -> tuple[int, bool]:
-    """Plan a batch and, in auto mode, apply it right away. Returns ``(batch_id, applied)``."""
     mode = mode or apply_mode(store)
+    if mode not in APPLY_MODES:
+        raise ValueError(f"apply mode must be one of: {', '.join(APPLY_MODES)}")
+    status = "staged" if mode == "safe" else "committed"
     with store.transaction():
-        batch_id = plan(store, description, ops)
-        if mode == "auto":
-            commit(store, batch_id)
-    return batch_id, mode == "auto"
-
-
-# Applying, undoing, redoing
-
-def commit(store: Store, batch_id: int) -> None:
-    batch = get_batch(store, batch_id)
-    if batch.status != "pending":
-        raise ChangeError(f"batch #{batch_id} is {batch.status}, not pending")
-    expected = json.loads(store.db.execute(
-        "SELECT expected FROM batches WHERE id = ?", (batch_id,)).fetchone()[0])
-    with store.transaction():
-        for pid, revision in expected.items():
-            now = store.revision(int(pid))
-            if now != revision:
-                what = "was deleted" if now is None else "has changed"
-                raise ChangeError(
-                    f"batch #{batch_id} is stale: playlist {pid} {what} since it was planned. "
-                    "Discard it and plan it again."
-                )
-        for seq, op_json in _ops(store, batch_id):
-            op = Operation.from_dict(json.loads(op_json))
+        _clear_redo(store)
+        batch_id = _new_batch(store, description, mode)
+        for seq, op in enumerate(ops):
             pid = op.target
             before = None if pid is None else store.playlist_state(pid)
             try:
                 after = op.apply(before)
             except ValueError as e:
-                raise ChangeError(f"batch #{batch_id}: {e}") from e
+                raise ChangeError(str(e)) from e
             if pid is None:
                 pid = store.create_state(after)
             else:
                 store.write_state(pid, after)
-            store.db.execute(
-                "UPDATE operations SET playlist_id = ?, before = ?, after = ? WHERE batch_id = ? AND seq = ?",
-                (pid, _dump(before), _dump(after), batch_id, seq),
-            )
-        _set_status(store, batch_id, "applied", "applied_at")
-
-
-def discard(store: Store, batch_id: int) -> None:
-    batch = get_batch(store, batch_id)
-    if batch.status != "pending":
-        raise ChangeError(f"batch #{batch_id} is {batch.status}; only pending batches can be discarded")
-    _set_status(store, batch_id, "discarded")
-
-
-def undo(store: Store, batch_id: int | None = None) -> int:
-    """Undo a batch (default: the most recently applied or redone one)."""
-    batch_id = batch_id or _latest(store, "applied", "nothing to undo")
-    batch = get_batch(store, batch_id)
-    if batch.status != "applied":
-        raise ChangeError(f"batch #{batch_id} is {batch.status}; only applied batches can be undone")
-    with store.transaction():
-        for pid, before, after in reversed(_snapshots(store, batch_id)):
-            _swap(store, batch_id, pid, expect=after, write=before, verb="undo")
-        _set_status(store, batch_id, "undone", "undone_at")
-    return batch_id
-
-
-def redo(store: Store, batch_id: int | None = None) -> int:
-    """Re-apply an undone batch (default: the most recently undone one)."""
-    batch_id = batch_id or _latest(store, "undone", "nothing to redo")
-    batch = get_batch(store, batch_id)
-    if batch.status != "undone":
-        raise ChangeError(f"batch #{batch_id} is {batch.status}; only undone batches can be redone")
-    with store.transaction():
-        for pid, before, after in _snapshots(store, batch_id):
-            _swap(store, batch_id, pid, expect=before, write=after, verb="redo")
-        _set_status(store, batch_id, "applied", "applied_at")
-    return batch_id
-
-
-def _swap(store: Store, batch_id: int, pid: int, expect, write, verb: str) -> None:
-    current = store.playlist_state(pid)
-    if current != expect:
-        name = (current or expect or write).name
-        later = _later_batch_touching(store, batch_id, pid)
-        if later and verb == "undo":
-            reason = f"{name!r} was changed later by batch #{later}; undo that first"
-        else:
-            reason = f"{name!r} has changed since"
-        raise ChangeError(f"can't {verb} batch #{batch_id}: {reason}")
-    store.write_state(pid, write)
+            _record_op(store, batch_id, seq, op.to_dict(), pid, before, after)
+        _set_status(store, batch_id, status, "applied_at")
+    return batch_id, status
 
 
 def record_import(store: Store, playlist: Playlist, source_name: str) -> tuple[int, str, int | None]:
-    """Save an imported playlist through the log, so a replace can be undone.
+    """Save an imported playlist through the log.
 
-    Imports only touch the local library, so they apply right away in either mode.
-    Returns ``(playlist_id, status, batch_id)``; nothing is logged for "unchanged".
+    Imports bring data into Segue rather than change a service, so they are committed right
+    away in either mode, and undoable like recent auto-mode changes. Returns
+    ``(playlist_id, status, batch_id)``; nothing is logged when nothing changed.
     """
     with store.transaction():
         existing = store.find_by_source(playlist.source) if playlist.source else None
@@ -219,66 +200,165 @@ def record_import(store: Store, playlist: Playlist, source_name: str) -> tuple[i
         after = store.playlist_state(pid)
         if after == before:
             return pid, "unchanged", None  # re-import of an identical playlist
-        cur = store.db.execute(
-            "INSERT INTO batches (description, status, created_at) VALUES (?, 'pending', ?)",
-            (f"import {playlist.name!r} from {source_name}", _now()),
-        )
-        batch_id = cur.lastrowid
-        store.db.execute(
-            "INSERT INTO operations (batch_id, seq, op, playlist_id, before, after) VALUES (?, 0, ?, ?, ?, ?)",
-            (batch_id, json.dumps({"kind": "import", "name": playlist.name, "file": source_name}),
-             pid, _dump(before), _dump(after)),
-        )
-        _set_status(store, batch_id, "applied", "applied_at")
+        _clear_redo(store)
+        batch_id = _new_batch(store, f"import {playlist.name!r} from {source_name}", "import")
+        _record_op(store, batch_id, 0, {"kind": "import", "name": playlist.name, "file": source_name},
+                   pid, before, after)
+        _set_status(store, batch_id, "committed", "applied_at")
     return pid, status, batch_id
+
+
+def commit(store: Store) -> list[int]:
+    """Make every staged batch final. Returns their IDs, oldest first."""
+    ids = [b.id for b in batches(store, ["staged"])]
+    with store.transaction():
+        for batch_id in ids:
+            _set_status(store, batch_id, "committed")
+    return ids
+
+
+def discard(store: Store) -> list[int]:
+    """Undo every staged batch, newest first, without keeping them for redo."""
+    discarded = []
+    with store.transaction():
+        while (batch_id := _latest(store, ["staged"])) is not None:
+            _revert(store, batch_id)
+            _set_status(store, batch_id, "discarded", "undone_at")
+            discarded.append(batch_id)
+    return discarded
+
+
+def undo(store: Store, batch_id: int | None = None) -> int:
+    """Undo a batch; by default the most recent change."""
+    if batch_id is None:
+        batch_id = _latest(store, ["staged", "committed"])
+        if batch_id is None:
+            raise ChangeError("nothing to undo")
+    batch = get_batch(store, batch_id)
+    if problem := _why_not_undoable(store, batch):
+        raise ChangeError(f"can't undo #{batch_id}: {problem}")
+    with store.transaction():
+        _revert(store, batch_id)
+        _set_status(store, batch_id, "undone", "undone_at")
+    return batch_id
+
+
+def redo(store: Store, batch_id: int | None = None) -> int:
+    """Re-apply an undone batch; by default the most recently undone one."""
+    if batch_id is None:
+        batch_id = _latest(store, ["undone"])
+        if batch_id is None:
+            raise ChangeError("nothing to redo")
+    batch = get_batch(store, batch_id)
+    if batch.status != "undone":
+        raise ChangeError(f"can't redo #{batch_id}: it is {batch.status}, not undone")
+    with store.transaction():
+        for pid, before, after in _snapshots(store, batch_id):
+            _swap(store, batch_id, pid, expect=before, write=after, verb="redo")
+        _set_status(store, batch_id, "staged" if batch.mode == "safe" else "committed", "applied_at")
+    return batch_id
+
+
+def can_undo(store: Store, batch: Batch) -> bool:
+    """Whether undoing ``batch`` would work right now (allowed, and nothing later in the way)."""
+    if _why_not_undoable(store, batch) is not None:
+        return False
+    return not any(
+        _later_batch_touching(store, batch.id, pid) for pid, _, _ in _snapshots(store, batch.id)
+    )
+
+
+def _why_not_undoable(store: Store, batch: Batch) -> str | None:
+    if batch.status == "staged":
+        return None
+    if batch.status != "committed":
+        return f"it is {batch.status}"
+    if batch.mode == "safe":
+        return "it was committed. Committed changes are final; restore a backup to go back"
+    limit = undo_limit(store)
+    recent = [
+        row[0] for row in store.db.execute(
+            "SELECT id FROM batches WHERE status = 'committed' AND mode IN ('auto', 'import')"
+            " ORDER BY changed_seq DESC LIMIT ?",
+            (limit,),
+        )
+    ]
+    if batch.id not in recent:
+        return f"only the last {limit} auto-mode changes can be undone (see: segue config undo-limit)"
+    return None
+
+
+def _revert(store: Store, batch_id: int) -> None:
+    for pid, before, after in reversed(_snapshots(store, batch_id)):
+        _swap(store, batch_id, pid, expect=after, write=before, verb="undo")
+
+
+def _swap(store: Store, batch_id: int, pid: int, expect, write, verb: str) -> None:
+    current = store.playlist_state(pid)
+    if current != expect:
+        name = (current or expect or write).name
+        later = _later_batch_touching(store, batch_id, pid)
+        if later and verb == "undo":
+            reason = f"{name!r} was changed later by #{later}; undo that first"
+        else:
+            reason = f"{name!r} has changed since"
+        raise ChangeError(f"can't {verb} #{batch_id}: {reason}")
+    store.write_state(pid, write)
 
 
 # Reading the log
 
 def get_batch(store: Store, batch_id: int) -> Batch:
-    row = store.db.execute(
-        "SELECT id, description, status, created_at, applied_at, undone_at FROM batches WHERE id = ?",
-        (batch_id,),
-    ).fetchone()
+    row = store.db.execute(f"SELECT {_BATCH_COLUMNS} FROM batches WHERE id = ?", (batch_id,)).fetchone()
     if row is None:
-        raise ChangeError(f"no batch #{batch_id}")
+        raise ChangeError(f"no change #{batch_id}")
     return Batch(*row)
 
 
-def batches(store: Store, status: str | None = None, limit: int | None = None) -> list[Batch]:
-    query = "SELECT id, description, status, created_at, applied_at, undone_at FROM batches"
+def batches(store: Store, statuses: list[str] | None = None, limit: int | None = None) -> list[Batch]:
+    """Batches in the order they were applied; with ``limit``, the most recent ones, newest first."""
+    query = f"SELECT {_BATCH_COLUMNS} FROM batches"
     params: list = []
-    if status:
-        query += " WHERE status = ?"
-        params.append(status)
-    query += " ORDER BY id DESC" if status != "pending" else " ORDER BY id"
+    if statuses:
+        query += f" WHERE status IN ({','.join('?' * len(statuses))})"
+        params.extend(statuses)
     if limit:
-        query += " LIMIT ?"
+        query += " ORDER BY changed_seq DESC LIMIT ?"
         params.append(limit)
+    else:
+        query += " ORDER BY changed_seq, id"
     return [Batch(*row) for row in store.db.execute(query, params)]
 
 
-def batch_ops(store: Store, batch_id: int) -> list[Operation]:
-    return [
-        Operation.from_dict(data) for _, text in _ops(store, batch_id)
-        if (data := json.loads(text))["kind"] != "import"
-    ]
-
-
-def _ops(store: Store, batch_id: int) -> list[tuple[int, str]]:
+def _op_rows(store: Store, batch_id: int):
     return store.db.execute(
-        "SELECT seq, op FROM operations WHERE batch_id = ? ORDER BY seq", (batch_id,)
+        "SELECT op, playlist_id, before, after FROM operations WHERE batch_id = ? ORDER BY seq",
+        (batch_id,),
     ).fetchall()
 
 
 def _snapshots(store: Store, batch_id: int):
-    return [
-        (row["playlist_id"], _load(row["before"]), _load(row["after"]))
-        for row in store.db.execute(
-            "SELECT playlist_id, before, after FROM operations WHERE batch_id = ? ORDER BY seq",
-            (batch_id,),
-        )
-    ]
+    return [(row["playlist_id"], _load(row["before"]), _load(row["after"])) for row in _op_rows(store, batch_id)]
+
+
+def _new_batch(store: Store, description: str, mode: str) -> int:
+    cur = store.db.execute(
+        "INSERT INTO batches (description, status, mode, created_at) VALUES (?, 'staged', ?, ?)",
+        (description, mode, _now()),
+    )
+    return cur.lastrowid
+
+
+def _record_op(store: Store, batch_id: int, seq: int, op: dict, pid: int, before, after) -> None:
+    store.db.execute(
+        "INSERT INTO operations (batch_id, seq, op, playlist_id, before, after) VALUES (?, ?, ?, ?, ?, ?)",
+        (batch_id, seq, json.dumps(op), pid, _dump(before), _dump(after)),
+    )
+
+
+def _clear_redo(store: Store) -> None:
+    for row in store.db.execute("SELECT id FROM batches WHERE status = 'undone'").fetchall():
+        _set_status(store, row[0], "discarded")
 
 
 def _set_status(store: Store, batch_id: int, status: str, stamp: str | None = None) -> None:
@@ -288,20 +368,20 @@ def _set_status(store: Store, batch_id: int, status: str, stamp: str | None = No
     store.db.execute(f"UPDATE batches SET status = ?, changed_seq = ?{stamp_sql} WHERE id = ?", params)
 
 
-def _latest(store: Store, status: str, empty: str) -> int:
+def _latest(store: Store, statuses: list[str]) -> int | None:
     row = store.db.execute(
-        "SELECT id FROM batches WHERE status = ? ORDER BY changed_seq DESC LIMIT 1", (status,)
+        f"SELECT id FROM batches WHERE status IN ({','.join('?' * len(statuses))})"
+        " ORDER BY changed_seq DESC LIMIT 1",
+        statuses,
     ).fetchone()
-    if row is None:
-        raise ChangeError(empty)
-    return row[0]
+    return row[0] if row else None
 
 
 def _later_batch_touching(store: Store, batch_id: int, pid: int) -> int | None:
     row = store.db.execute(
         "SELECT b.id FROM batches b JOIN operations o ON o.batch_id = b.id"
-        " WHERE b.status = 'applied' AND o.playlist_id = ? AND b.changed_seq >"
+        " WHERE b.status IN ('staged', 'committed') AND o.playlist_id = ? AND b.id != ? AND b.changed_seq >"
         " (SELECT changed_seq FROM batches WHERE id = ?) ORDER BY b.changed_seq DESC LIMIT 1",
-        (pid, batch_id),
+        (pid, batch_id, batch_id),
     ).fetchone()
     return row[0] if row else None

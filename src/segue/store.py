@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -15,7 +16,7 @@ from .model import (
     EntryState, Playlist, PlaylistEntry, PlaylistState, ServiceRef, Track, normalize, normalize_isrc,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Two durations further apart than this mean two different recordings.
 DURATION_TOLERANCE_MS = 3000
@@ -54,6 +55,7 @@ CREATE TABLE playlists (
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     revision       INTEGER NOT NULL DEFAULT 0,   -- bumped on every change
+    kind           TEXT NOT NULL DEFAULT 'created', -- created | collaborative | followed | liked
     UNIQUE (source_service, source_id)
 );
 
@@ -71,7 +73,7 @@ CREATE TABLE playlist_entries (
 CREATE INDEX playlist_entries_track ON playlist_entries(track_id);
 """
 
-_LOG_SCHEMA = """
+_V2_LOG_SCHEMA = """
 CREATE TABLE settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -102,6 +104,55 @@ CREATE TABLE operations (
 );
 """
 
+_BACKUP_SCHEMA = """
+-- Backups written by Segue, and the revision of each playlist they contain, so Segue can
+-- tell whether a playlist has changed since its last backup.
+CREATE TABLE backups (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    paths      TEXT NOT NULL      -- JSON list of the files written
+);
+
+CREATE TABLE backup_playlists (
+    backup_id   INTEGER NOT NULL REFERENCES backups(id) ON DELETE CASCADE,
+    playlist_id INTEGER NOT NULL,
+    revision    INTEGER NOT NULL,
+    PRIMARY KEY (backup_id, playlist_id)
+);
+CREATE INDEX backup_playlists_playlist ON backup_playlists(playlist_id, revision);
+"""
+
+_LOG_SCHEMA = """
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- The change log. A batch is one user action (e.g. a merge). It is applied to the library
+-- as soon as it is made: "staged" in safe mode until committed, "committed" in auto mode.
+CREATE TABLE batches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    description TEXT NOT NULL,
+    status      TEXT NOT NULL,   -- staged | committed | undone | discarded
+    mode        TEXT NOT NULL,   -- safe | auto | import
+    created_at  TEXT NOT NULL,
+    applied_at  TEXT,
+    undone_at   TEXT,
+    -- Increases on every apply, commit, undo and redo, so "the last change" is unambiguous.
+    changed_seq INTEGER
+);
+
+CREATE TABLE operations (
+    batch_id    INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    seq         INTEGER NOT NULL,
+    op          TEXT NOT NULL,   -- JSON of the operation
+    playlist_id INTEGER,         -- known once applied (a create gets its ID then)
+    before      TEXT,            -- JSON PlaylistState snapshots, NULL = no playlist
+    after       TEXT,
+    PRIMARY KEY (batch_id, seq)
+);
+""" + _BACKUP_SCHEMA
+
 _SCHEMA += _LOG_SCHEMA
 
 # Upgrades from each older schema version to the next.
@@ -125,7 +176,18 @@ INSERT INTO playlists_v2 (id, name, description, source_service, source_id, sour
     FROM playlists;
 DROP TABLE playlists;
 ALTER TABLE playlists_v2 RENAME TO playlists;
-""" + _LOG_SCHEMA,
+""" + _V2_LOG_SCHEMA,
+    3: """
+ALTER TABLE playlists ADD COLUMN kind TEXT NOT NULL DEFAULT 'created';
+ALTER TABLE batches ADD COLUMN mode TEXT NOT NULL DEFAULT 'auto';
+ALTER TABLE batches DROP COLUMN expected;
+UPDATE batches SET mode = 'import'
+    WHERE id IN (SELECT batch_id FROM operations WHERE op LIKE '{"kind": "import"%');
+UPDATE batches SET status = 'discarded' WHERE status = 'pending';
+UPDATE batches SET status = 'committed' WHERE status = 'applied';
+UPDATE settings SET value = 'safe' WHERE key = 'apply_mode' AND value = 'commit';
+UPDATE settings SET value = 'auto' WHERE key = 'apply_mode' AND value NOT IN ('safe', 'auto');
+""" + _BACKUP_SCHEMA,
 }
 
 
@@ -145,6 +207,7 @@ class PlaylistSummary:
     name: str
     source: ServiceRef | None
     track_count: int
+    kind: str = "created"
 
 
 class Store:
@@ -156,6 +219,13 @@ class Store:
         self._depth = 0
         self._migrate()
         self.db.execute("PRAGMA foreign_keys = ON")
+        if self.get_setting("library_id") is None:
+            # Ties backups to this library, so a restore never matches another library's IDs.
+            self.set_setting("library_id", uuid.uuid4().hex[:12])
+
+    @property
+    def library_id(self) -> str:
+        return self.get_setting("library_id")
 
     def __enter__(self) -> Store:
         return self
@@ -316,18 +386,19 @@ class Store:
             if existing:
                 playlist_id = existing[0]
                 self.db.execute(
-                    "UPDATE playlists SET name = ?, description = ?, source_url = ?, updated_at = ?,"
-                    " revision = revision + 1 WHERE id = ?",
-                    (playlist.name, playlist.description, playlist.source.url, now, playlist_id),
+                    "UPDATE playlists SET name = ?, description = ?, source_url = ?, kind = ?,"
+                    " updated_at = ?, revision = revision + 1 WHERE id = ?",
+                    (playlist.name, playlist.description, playlist.source.url, playlist.kind,
+                     now, playlist_id),
                 )
                 self.db.execute("DELETE FROM playlist_entries WHERE playlist_id = ?", (playlist_id,))
             else:
                 src = playlist.source
                 cur = self.db.execute(
                     "INSERT INTO playlists (name, description, source_service, source_id, source_url,"
-                    " created_at, updated_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                    " kind, created_at, updated_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
                     (playlist.name, playlist.description, src and src.service, src and src.id,
-                     src and src.url, now, now),
+                     src and src.url, playlist.kind, now, now),
                 )
                 playlist_id = cur.lastrowid
             self._insert_entries(playlist_id, [
@@ -360,7 +431,8 @@ class Store:
             " GROUP BY p.id ORDER BY p.name COLLATE NOCASE, p.id"
         )
         return [
-            PlaylistSummary(row["id"], row["name"], self._source(row), row["n"]) for row in rows
+            PlaylistSummary(row["id"], row["name"], self._source(row), row["n"], row["kind"])
+            for row in rows
         ]
 
     def get_playlist(self, playlist_id: int) -> Playlist:
@@ -375,7 +447,7 @@ class Store:
         tracks = self._load_tracks([e["track_id"] for e in entries])
         return Playlist(
             id=row["id"], name=row["name"], description=row["description"],
-            source=self._source(row),
+            source=self._source(row), kind=row["kind"],
             entries=[PlaylistEntry(_with_ref_first(tracks[e["track_id"]], e), e["added_at"]) for e in entries],
         )
 
@@ -413,8 +485,17 @@ class Store:
         )
         return PlaylistState(
             name=row["name"], description=row["description"], source=self._source(row),
-            entries=tuple(EntryState(*e) for e in entries),
+            entries=tuple(EntryState(*e) for e in entries), kind=row["kind"],
         )
+
+    def to_state(self, playlist: Playlist) -> PlaylistState:
+        """The stored form of a playlist read from a file, adding any new tracks to the library."""
+        with self.transaction():
+            entries = tuple(
+                EntryState(self.resolve_track(e.track), e.added_at, *_entry_ref(e, playlist.source))
+                for e in playlist.entries
+            )
+        return PlaylistState(playlist.name, playlist.description, playlist.source, entries, playlist.kind)
 
     def revision(self, playlist_id: int) -> int | None:
         row = self.db.execute("SELECT revision FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
@@ -427,9 +508,9 @@ class Store:
             src = state.source
             cur = self.db.execute(
                 "INSERT INTO playlists (name, description, source_service, source_id, source_url,"
-                " created_at, updated_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                " kind, created_at, updated_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
                 (state.name, state.description, src and src.service, src and src.id,
-                 src and src.url, now, now),
+                 src and src.url, state.kind, now, now),
             )
             self._insert_entries(cur.lastrowid, state.entries)
         return cur.lastrowid
@@ -447,17 +528,18 @@ class Store:
             now = _now()
             src = state.source
             values = (state.name, state.description, src and src.service, src and src.id,
-                      src and src.url)
+                      src and src.url, state.kind)
             if self.revision(playlist_id) is None:
                 self.db.execute(
                     "INSERT INTO playlists (id, name, description, source_service, source_id,"
-                    " source_url, created_at, updated_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                    " source_url, kind, created_at, updated_at, revision)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
                     (playlist_id, *values, now, now),
                 )
             else:
                 self.db.execute(
                     "UPDATE playlists SET name = ?, description = ?, source_service = ?, source_id = ?,"
-                    " source_url = ?, updated_at = ?, revision = revision + 1 WHERE id = ?",
+                    " source_url = ?, kind = ?, updated_at = ?, revision = revision + 1 WHERE id = ?",
                     (*values, now, playlist_id),
                 )
                 self.db.execute("DELETE FROM playlist_entries WHERE playlist_id = ?", (playlist_id,))

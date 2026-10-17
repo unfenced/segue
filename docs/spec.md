@@ -136,8 +136,10 @@ creates a **new** playlist, so its old link and followers don't come back.
   so you can keep organizing on top of it, for example merge and then dedupe the result.
   **Undo** and **redo** step through the staged changes. **Commit** writes them all to the
   services. **After a commit there is no undo**: the backup is the way back.
-- **Auto mode:** every change is written to the service immediately. **Assumption:** auto mode
-  has no undo, because each change is final as soon as it's made; the backup is the safety net.
+- **Auto mode:** every change is written to the service immediately. The most recent changes
+  (20 by default; `segue config undo-limit`) can still be undone. Undo writes the previous
+  state back to the service, so a playlist deleted there comes back with a new link, and
+  tracks put back get a new "date added".
 
 Before a commit, Segue re-reads the affected playlists. If one changed on the service in the
 meantime (for example, edited on your phone), it shows the conflict instead of overwriting it.
@@ -196,7 +198,5 @@ meantime (for example, edited on your phone), it shows the conflict instead of o
    merge *Gym 2* into *Gym* on Spotify and delete *Gym 2*. Should TIDAL get the same result
    (its *Gym 2* deleted and the tracks merged into its *Gym*), or should TIDAL's *Gym 2* be
    left alone because the deletion was organizing, not a real deletion?
-2. **Undo in auto mode.** No undo at all (assumed above), or undo for the last few changes even
-   though they're already on the service?
-3. **Default for followed playlists in sync rules:** excluded unless you include them, or the
+2. **Default for followed playlists in sync rules:** excluded unless you include them, or the
    other way around?

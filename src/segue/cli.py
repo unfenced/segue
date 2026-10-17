@@ -5,13 +5,18 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from datetime import datetime
 from pathlib import Path
 
-from . import __version__, changes, edits
+from . import __version__, backup, changes, dupes, edits
 from .formats import FORMATS, csv_format, detect_format, json_format, m3u_format, read_playlists
-from .model import Playlist
+from .model import Playlist, normalize
+from .ops import DeletePlaylist
 from .store import Store, default_db_path
+
+MODE_HELP = {
+    "safe": "stage changes; undo freely; nothing is final until you commit",
+    "auto": "apply each change right away; the last few can still be undone",
+}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -20,6 +25,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=Path, default=None,
                         help=f"library file (default: $SEGUE_DB or {default_db_path()})")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("setup", help="choose how duplicates are found and how changes are applied")
+    p.add_argument("--duplicates", choices=dupes.LEVELS)
+    p.add_argument("--keep", choices=dupes.KEEPS)
+    p.add_argument("--apply-mode", choices=changes.APPLY_MODES)
+    p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("import", help="import playlists from JSON, CSV or M3U files")
     p.add_argument("files", nargs="+", type=Path)
@@ -46,25 +57,38 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("playlist", help="ID or name")
     p.set_defaults(func=cmd_show)
 
-    # Changes: each goes through the change log (queued or applied, per apply mode).
+    # Changes: each is staged (safe mode) or applied right away (auto mode).
     def change_parser(name, help):
         p = sub.add_parser(name, help=help)
         group = p.add_mutually_exclusive_group()
         group.add_argument("--now", dest="mode", action="store_const", const="auto",
-                           help="apply right away, even in commit mode")
-        group.add_argument("--queue", dest="mode", action="store_const", const="commit",
-                           help="queue for review, even in auto mode")
+                           help="apply right away, as in auto mode")
+        group.add_argument("--stage", dest="mode", action="store_const", const="safe",
+                           help="stage for commit, as in safe mode")
         group.add_argument("--dry-run", dest="mode", action="store_const", const="dry",
                            help="only show what would change")
         return p
+
+    def backup_flags(p):
+        group = p.add_mutually_exclusive_group()
+        group.add_argument("--backup", action="store_true",
+                           help="if a deleted playlist isn't backed up yet, back up first without asking")
+        group.add_argument("--no-backup", action="store_true",
+                           help="delete even if there is no backup of the current version")
+
+    def followed_flag(p):
+        p.add_argument("--include-followed", action="store_true",
+                       help="also match followed playlists when selecting by name")
 
     p = change_parser("rename", "rename a playlist")
     p.add_argument("playlist", help="ID or name")
     p.add_argument("name", help="new name")
     p.set_defaults(func=cmd_rename)
 
-    p = change_parser("delete", "delete playlists")
+    p = change_parser("delete", "delete playlists (unfollow, for followed ones)")
     p.add_argument("playlists", nargs="+", help="IDs or names")
+    backup_flags(p)
+    followed_flag(p)
     p.set_defaults(func=cmd_delete)
 
     p = change_parser("remove", "remove tracks from a playlist by position")
@@ -72,8 +96,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("positions", nargs="+", type=int, help="positions as shown by 'segue show'")
     p.set_defaults(func=cmd_remove)
 
-    p = change_parser("dedupe", "remove repeated tracks from playlists, keeping the first")
+    p = change_parser("dedupe", "remove duplicate tracks from playlists")
     p.add_argument("playlists", nargs="+", help="IDs or names")
+    p.add_argument("--duplicates", choices=dupes.LEVELS, help="override the duplicate setting")
+    p.add_argument("--keep", choices=dupes.KEEPS, help="override which copy is kept")
+    followed_flag(p)
     p.set_defaults(func=cmd_dedupe)
 
     p = change_parser("merge", "merge playlists without duplicate tracks")
@@ -82,22 +109,31 @@ def main(argv: list[str] | None = None) -> int:
     target.add_argument("--into", metavar="PLAYLIST", help="existing playlist to merge into")
     target.add_argument("--new", metavar="NAME", help="create a new playlist with this name")
     p.add_argument("--delete-sources", action="store_true", help="delete the merged-in playlists")
+    p.add_argument("--duplicates", choices=dupes.LEVELS, help="override the duplicate setting")
+    backup_flags(p)
+    followed_flag(p)
     p.set_defaults(func=cmd_merge)
 
+    p = change_parser("restore", "put playlists back as they are in a backup file")
+    p.add_argument("file", type=Path)
+    p.add_argument("--format", choices=FORMATS, help="override detection by file extension")
+    p.add_argument("-p", "--playlist", action="append", default=[],
+                   help="only restore this playlist (name); repeatable")
+    p.set_defaults(func=cmd_restore)
+
     # The change log
-    p = sub.add_parser("pending", help="show changes waiting to be committed")
+    p = sub.add_parser("pending", help="show staged changes waiting for commit")
     p.set_defaults(func=cmd_pending)
 
-    p = sub.add_parser("commit", help="apply pending changes (default: all, oldest first)")
-    p.add_argument("batches", nargs="*", type=int)
+    p = sub.add_parser("commit", help="make all staged changes final")
     p.set_defaults(func=cmd_commit)
 
-    p = sub.add_parser("discard", help="drop pending changes (default: all)")
-    p.add_argument("batches", nargs="*", type=int)
+    p = sub.add_parser("discard", help="throw away all staged changes")
     p.set_defaults(func=cmd_discard)
 
-    p = sub.add_parser("history", help="show applied and undone changes")
+    p = sub.add_parser("history", help="show recent changes")
     p.add_argument("-n", type=int, default=20, help="how many (default 20)")
+    p.add_argument("--all", action="store_true", help="include discarded changes")
     p.set_defaults(func=cmd_history)
 
     p = sub.add_parser("undo", help="undo a change (default: the last one)")
@@ -109,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_redo)
 
     p = sub.add_parser("config", help="show or change settings")
-    p.add_argument("key", nargs="?", choices=["apply-mode"])
+    p.add_argument("key", nargs="?", choices=["apply-mode", "duplicates", "keep", "undo-limit"])
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_config)
 
@@ -124,6 +160,24 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+# Library
+
+def cmd_setup(store: Store, args) -> int:
+    flags = args.duplicates or args.keep or args.apply_mode
+    if not flags and not _interactive():
+        raise ValueError("setup asks questions in a terminal; or pass --duplicates, --keep and --apply-mode")
+    if args.duplicates or not flags:
+        dupes.set_level(store, args.duplicates or _choose(
+            "What counts as a duplicate?", dupes.LEVEL_HELP, dupes.level(store)))
+    if args.keep or not flags:
+        dupes.set_keep(store, args.keep or _choose(
+            "When removing duplicates, which copy is kept?", dupes.KEEP_HELP, dupes.keep(store)))
+    if args.apply_mode or not flags:
+        changes.set_apply_mode(store, args.apply_mode or _choose(
+            "How should changes be applied?", MODE_HELP, changes.apply_mode(store)))
+    return cmd_config(store, argparse.Namespace(key=None, value=None))
+
+
 def cmd_import(store: Store, args) -> int:
     before = store.track_count()
     for path in args.files:
@@ -132,12 +186,11 @@ def cmd_import(store: Store, args) -> int:
             note = f"  [#{batch_id}]" if batch_id else ""
             print(f"{status} {playlist.name!r} ({len(playlist.entries)} tracks) from {path.name}{note}")
     print(f"library: {store.track_count()} tracks ({store.track_count() - before} new)")
-    print("undo an import with: segue undo <#>")
     return 0
 
 
 def cmd_export(store: Store, args) -> int:
-    playlists = _select(store, args.playlist)
+    playlists = _select(store, args.playlist, include_followed=True)
     # A path without an extension is a folder of M3U files.
     fmt = args.format or ("m3u" if not args.output.suffix else detect_format(args.output))
 
@@ -158,21 +211,18 @@ def cmd_export(store: Store, args) -> int:
             print(f"wrote {path}{note}")
     else:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        (json_format if fmt == "json" else csv_format).write(playlists, args.output)
+        (json_format if fmt == "json" else csv_format).write(playlists, args.output, store.library_id)
         print(f"wrote {len(playlists)} playlists to {args.output}")
     return 0
 
 
 def cmd_backup(store: Store, args) -> int:
-    folder = args.folder or Path(args.db_path).parent / "backups"
-    folder.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    playlists = store.all_playlists()
-    for fmt, module in (("json", json_format), ("csv", csv_format)):
-        path = folder / f"segue-backup-{stamp}.{fmt}"
-        module.write(playlists, path)
+    paths = backup.write_backup(store, args.folder or backup.default_folder(args.db_path))
+    for path in paths:
         print(f"wrote {path}")
-    print(f"{len(playlists)} playlists, {sum(len(p.entries) for p in playlists)} entries")
+    summaries = store.playlist_summaries()
+    print(f"{len(summaries)} playlists, {sum(s.track_count for s in summaries)} entries. "
+          "Restore with: segue restore <file>")
     return 0
 
 
@@ -182,15 +232,19 @@ def cmd_list(store: Store, args) -> int:
         print("No playlists yet. Add some with: segue import <file>")
         return 0
     width = max(len(s.name) for s in summaries)
+    kinds = {s.id: "" if s.kind == "created" else s.kind for s in summaries}
+    kind_width = max(len(k) for k in kinds.values())
     for s in summaries:
         source = f"{s.source.service}:{s.source.id}" if s.source else "-"
-        print(f"{s.id:>5}  {s.name:<{width}}  {s.track_count:>5} tracks  {source}")
+        kind = f"{kinds[s.id]:<{kind_width}}  " if kind_width else ""
+        print(f"{s.id:>5}  {s.name:<{width}}  {s.track_count:>5} tracks  {kind}{source}")
     return 0
 
 
 def cmd_show(store: Store, args) -> int:
-    for playlist in _select(store, [args.playlist]):
-        print(f"{playlist.name} ({len(playlist.entries)} tracks)")
+    for playlist in _select(store, [args.playlist], include_followed=True):
+        kind = "" if playlist.kind == "created" else f", {playlist.kind}"
+        print(f"{playlist.name} ({len(playlist.entries)} tracks{kind})")
         for position, track in enumerate(playlist.tracks, start=1):
             artists = ", ".join(track.artists) or "?"
             length = ""
@@ -202,12 +256,15 @@ def cmd_show(store: Store, args) -> int:
     return 0
 
 
+# Changes
+
 def cmd_rename(store: Store, args) -> int:
     return _submit(store, args, edits.plan_rename(store, _one(store, args.playlist), args.name))
 
 
 def cmd_delete(store: Store, args) -> int:
-    return _submit(store, args, edits.plan_delete(store, _ids(store, args.playlists)))
+    ids = _ids(store, args.playlists, args.include_followed)
+    return _submit(store, args, edits.plan_delete(store, ids))
 
 
 def cmd_remove(store: Store, args) -> int:
@@ -215,14 +272,33 @@ def cmd_remove(store: Store, args) -> int:
 
 
 def cmd_dedupe(store: Store, args) -> int:
-    return _submit(store, args, edits.plan_dedupe(store, _ids(store, args.playlists)))
+    if not args.duplicates:
+        _ensure_duplicate_setting(store)
+    ids = _ids(store, args.playlists, args.include_followed)
+    return _submit(store, args, edits.plan_dedupe(store, ids, args.duplicates, args.keep))
 
 
 def cmd_merge(store: Store, args) -> int:
+    if not args.duplicates:
+        _ensure_duplicate_setting(store)
     into = _one(store, args.into) if args.into else None
-    plan = edits.plan_merge(store, _ids(store, args.playlists), into_id=into,
-                            into_name=args.new, delete_sources=args.delete_sources)
+    plan = edits.plan_merge(store, _ids(store, args.playlists, args.include_followed), into_id=into,
+                            into_name=args.new, delete_sources=args.delete_sources,
+                            level=args.duplicates)
     return _submit(store, args, plan)
+
+
+def cmd_restore(store: Store, args) -> int:
+    playlists = read_playlists(args.file, args.format)
+    if args.playlist:
+        wanted = {normalize(name) for name in args.playlist}
+        playlists = [p for p in playlists if normalize(p.name) in wanted]
+        if not playlists:
+            raise ValueError(f"none of {', '.join(map(repr, args.playlist))} are in {args.file.name}")
+    description, ops, notes = backup.plan_restore(store, playlists)
+    for note in notes:
+        print(note)
+    return _submit(store, args, (description, ops))
 
 
 def _submit(store: Store, args, plan: edits.Plan) -> int:
@@ -236,54 +312,94 @@ def _submit(store: Store, args, plan: edits.Plan) -> int:
     if args.mode == "dry":
         print("dry run: nothing changed")
         return 0
-    batch_id, applied = changes.submit(store, description, ops, args.mode)
-    if applied:
-        print(f"applied as #{batch_id}. Undo with: segue undo")
+    _backup_gate(store, args, ops)
+    batch_id, status = changes.submit(store, description, ops, args.mode)
+    if status == "staged":
+        print(f"staged as #{batch_id}. Undo with: segue undo. Make it final with: segue commit")
     else:
-        print(f"queued as #{batch_id}. Apply with: segue commit (or discard with: segue discard {batch_id})")
+        print(f"applied as #{batch_id}. Undo with: segue undo")
     return 0
 
 
+def _backup_gate(store: Store, args, ops) -> None:
+    """Before deleting playlists, make sure their current version is in a backup."""
+    deleting = [op.playlist_id for op in ops if isinstance(op, DeletePlaylist)]
+    missing = backup.not_backed_up(store, deleting)
+    if not missing:
+        return
+    names = ", ".join(repr(store.playlist_state(pid).name) for pid in missing)
+    last = backup.last_backup_time(store)
+    since = f"The last backup is from {last[:10]}." if last else "You haven't made a backup yet."
+    message = f"{since} It doesn't include the current version of {names}."
+    if getattr(args, "no_backup", False):
+        print(f"warning: {message} Continuing without a backup (--no-backup).")
+        return
+    if getattr(args, "backup", False) or (_interactive() and _confirm(f"{message}\nMake a backup now? [Y/n] ")):
+        for path in backup.write_backup(store, backup.default_folder(args.db_path)):
+            print(f"backed up to {path}")
+        return
+    if _interactive():
+        raise ValueError("cancelled; nothing changed")
+    raise ValueError(f"{message} Run again with --backup to make one first, or --no-backup to go ahead without.")
+
+
+def _ensure_duplicate_setting(store: Store) -> None:
+    if dupes.is_configured(store):
+        return
+    if _interactive():
+        print("First, choose what counts as a duplicate. You can change this later with: segue setup")
+        dupes.set_level(store, _choose("What counts as a duplicate?", dupes.LEVEL_HELP, dupes.DEFAULT_LEVEL))
+        dupes.set_keep(store, _choose("When removing duplicates, which copy is kept?", dupes.KEEP_HELP,
+                                      dupes.DEFAULT_KEEP))
+    else:
+        print(f"using the default duplicate setting {dupes.DEFAULT_LEVEL!r}; choose one with: segue setup")
+
+
+# The change log
+
 def cmd_pending(store: Store, args) -> int:
-    pending = changes.batches(store, "pending")
-    if not pending:
-        print("nothing pending")
+    staged = changes.batches(store, ["staged"])
+    if not staged:
+        print("nothing staged")
         return 0
-    for batch in pending:
-        print(f"#{batch.id}  {batch.description}")
-        for line in changes.preview(store, changes.batch_ops(store, batch.id)):
-            print(f"      - {line}")
-    print("apply with: segue commit [#...]   drop with: segue discard [#...]")
+    print("staged changes (newest last):")
+    for batch in staged:
+        print(f"  #{batch.id}  {batch.description}")
+        for line in changes.describe_batch(store, batch.id):
+            print(f"        - {line}")
+    print("commit will write:")
+    for line in changes.describe_staged(store) or ["nothing (the staged changes cancel out)"]:
+        print(f"  - {line}")
+    print("undo with: segue undo   make final with: segue commit   throw away with: segue discard")
     return 0
 
 
 def cmd_commit(store: Store, args) -> int:
-    ids = args.batches or [b.id for b in changes.batches(store, "pending")]
+    ids = changes.commit(store)
     if not ids:
-        print("nothing pending")
-    for batch_id in ids:
-        changes.commit(store, batch_id)
-        print(f"applied #{batch_id}  {changes.get_batch(store, batch_id).description}")
+        print("nothing staged")
+        return 0
+    print(f"committed {len(ids)} change{'s' if len(ids) != 1 else ''} "
+          f"({', '.join(f'#{i}' for i in ids)}). They are final now and can't be undone.")
+    print("(no services are connected yet, so nothing was written to one)")
     return 0
 
 
 def cmd_discard(store: Store, args) -> int:
-    ids = args.batches or [b.id for b in changes.batches(store, "pending")]
-    if not ids:
-        print("nothing pending")
-    for batch_id in ids:
-        changes.discard(store, batch_id)
-        print(f"discarded #{batch_id}")
+    ids = changes.discard(store)
+    print(f"discarded {', '.join(f'#{i}' for i in ids)}" if ids else "nothing staged")
     return 0
 
 
 def cmd_history(store: Store, args) -> int:
-    shown = [b for b in changes.batches(store, limit=args.n * 2) if b.status in ("applied", "undone")]
+    statuses = None if args.all else ["staged", "committed", "undone"]
+    shown = changes.batches(store, statuses, limit=args.n)
     if not shown:
         print("no changes yet")
-    for batch in shown[:args.n]:
-        when = (batch.undone_at if batch.status == "undone" else batch.applied_at) or ""
-        print(f"#{batch.id:<4} {batch.status:<8} {when[:19].replace('T', ' ')}  {batch.description}")
+    for batch in shown:
+        when = (batch.undone_at if batch.status in ("undone", "discarded") else batch.applied_at) or ""
+        mark = "  (can undo)" if changes.can_undo(store, batch) else ""
+        print(f"#{batch.id:<4} {batch.status:<9} {when[:16].replace('T', ' ')}  {batch.description}{mark}")
     return 0
 
 
@@ -300,34 +416,77 @@ def cmd_redo(store: Store, args) -> int:
 
 
 def cmd_config(store: Store, args) -> int:
+    getters = {
+        "apply-mode": (changes.apply_mode, changes.set_apply_mode),
+        "duplicates": (dupes.level, dupes.set_level),
+        "keep": (dupes.keep, dupes.set_keep),
+        "undo-limit": (changes.undo_limit, changes.set_undo_limit),
+    }
     if args.key is None:
-        print(f"apply-mode = {changes.apply_mode(store)}")
+        for key, (get, _) in getters.items():
+            print(f"{key} = {get(store)}")
         return 0
-    if args.value is None:
-        print(changes.apply_mode(store))
-        return 0
-    changes.set_apply_mode(store, args.value)
-    print(f"apply-mode = {args.value}")
+    get, put = getters[args.key]
+    if args.value is not None:
+        put(store, args.value)
+    print(f"{args.key} = {get(store)}")
     return 0
 
 
-def _ids(store: Store, selectors: list[str]) -> list[int]:
-    return [p.id for p in _select(store, selectors)]
+# Helpers
+
+def _interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _confirm(question: str) -> bool:
+    return input(question).strip().lower() in ("", "y", "yes")
+
+
+def _choose(question: str, options: dict[str, str], default: str) -> str:
+    keys = list(options)
+    print(question)
+    for number, key in enumerate(keys, start=1):
+        marker = " (current)" if key == default else ""
+        print(f"  {number}. {key}: {options[key]}{marker}")
+    while True:
+        answer = input(f"Choose 1-{len(keys)} [{keys.index(default) + 1}]: ").strip()
+        if not answer:
+            return default
+        if answer.isdigit() and 1 <= int(answer) <= len(keys):
+            return keys[int(answer) - 1]
+        if answer in options:
+            return answer
+
+
+def _ids(store: Store, selectors: list[str], include_followed: bool = False) -> list[int]:
+    return [p.id for p in _select(store, selectors, include_followed)]
 
 
 def _one(store: Store, selector: str) -> int:
-    ids = _ids(store, [selector])
+    ids = _ids(store, [selector], include_followed=True)
     if len(ids) > 1:
         raise ValueError(f"{selector!r} matches several playlists ({', '.join(map(str, ids))}); use an ID")
     return ids[0]
 
 
-def _select(store: Store, selectors: list[str]) -> list[Playlist]:
+def _select(store: Store, selectors: list[str], include_followed: bool = False) -> list[Playlist]:
+    """Playlists by ID or name. Names skip followed playlists unless ``include_followed``."""
     if not selectors:
         return store.all_playlists()
     playlists: dict[int, Playlist] = {}
     for selector in selectors:
-        found = [store.get_playlist(int(selector))] if selector.isdigit() else store.find_playlists(selector)
+        if selector.isdigit():
+            found = [store.get_playlist(int(selector))]
+        else:
+            found = store.find_playlists(selector)
+            skipped = [p for p in found if p.kind == "followed" and not include_followed]
+            for p in skipped:
+                print(f"skipping followed playlist {p.name!r} (#{p.id}); use --include-followed to include it")
+            skipped_ids = {p.id for p in skipped}
+            found = [p for p in found if p.id not in skipped_ids]
+            if not found and skipped:
+                raise ValueError(f"{selector!r} only matches followed playlists")
         if not found:
             raise ValueError(f"no playlist matches {selector!r}")
         for p in found:
