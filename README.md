@@ -4,6 +4,33 @@ One place to manage playlists across music streaming services: connect accounts,
 see every playlist side by side, clean them up, merge them, and keep them in sync —
 so switching away from Spotify (or any other service) takes minutes, not weekends.
 
+## Status
+
+Step 1 is done: the neutral track library, SQLite store, and JSON/CSV/M3U import and export
+(see the build order below). There are no service connectors yet. You can already import
+playlist exports from other tools, such as [Exportify](https://exportify.net) CSVs for Spotify.
+
+```bash
+uv run segue import "Liked Songs.csv" road-trip.m3u8 backup.json
+uv run segue list
+uv run segue show "road trip"
+uv run segue export everything.csv              # or .json; a folder name → one .m3u8 per playlist
+uv run segue export chill.m3u8 -p Chill --prefer spotify
+uv run segue backup                             # timestamped JSON + CSV next to the library
+uv run pytest
+```
+
+The library lives at `~/.segue/segue.db`; override it with `--db` or `SEGUE_DB`.
+
+| Format | Use it for | Keeps |
+|---|---|---|
+| JSON | Backups and restores | Everything: all service IDs per track, ISRC, added dates, playlist source |
+| CSV | Spreadsheets, and imports from other tools | One ID per service per row; reads Exportify-style and semicolon (Dutch Excel) files |
+| M3U8 | Media players | Title, artists, length, album and one link or file path; tracks without either are left out |
+
+Importing is safe to repeat. A playlist with a service ID replaces its earlier copy, and an
+identical playlist without one is skipped instead of duplicated.
+
 ## Goals
 
 1. **Connect** several services at once.
@@ -105,7 +132,7 @@ the same regardless of service.
 
 ## Build order (working plan)
 
-1. Neutral model + SQLite store + CSV/JSON/M3U import/export (this is also the backup).
+1. ✅ Neutral model + SQLite store + CSV/JSON/M3U import/export (this is also the backup).
 2. Planned operations, operation log and undo — tested against the local-files "service".
 3. Spotify connector (read, then write) behind the mandatory backup gate.
 4. Cleanup and batch tools: duplicates, merge by name, bulk delete, with previews.
