@@ -105,20 +105,49 @@ matches each one to its ID on every connected service:
 Playlists are stored as ordered lists of neutral tracks, so merge, dedupe and sync work
 the same regardless of service.
 
-## Services: what is realistic (check before building each connector)
+## Account linking
 
-| Service | Access | Notes |
-|---|---|---|
-| Spotify | Official Web API (OAuth) | New apps start in development mode with a small user allowlist; fine for a bring-your-own-key tool |
-| Apple Music | Official MusicKit / Apple Music API | Needs a paid Apple Developer account for the developer token |
-| YouTube Music | No official API; community `ytmusicapi` | Works, but can break when YouTube changes things |
-| Tidal | Official developer API | Check current playlist write access |
-| Deezer | Official API | Check whether new app registrations are open |
-| Local files | M3U / XSPF / CSV import & export | Always available; a good first "service" for testing |
+There's no browser trick for logging in. A clean "Connect" button only works when the
+service has registered the app (OAuth) — that is how Soundiiz and TuneMyMusic do it, with
+partner app IDs. Without that, the only options are pasting a token or cookie from the
+service's web player, or a helper (a browser extension or local browser) that captures it.
+
+Every connector declares **how** it connects and **what** the connection allows:
+
+- **Auth kind:** `oauth_redirect` (browser consent + callback), `oauth_device` (show a code,
+  approve on another device), `token_paste` (copy a value from the web player's dev tools),
+  or `file` (no account: imports and public playlist links).
+- **Capabilities:** `library_read`, `library_write`, `public_playlist_read`,
+  `favorites_write`. A connection can be read-only; the UI and engine only offer what was
+  granted.
+- **Status** comes from a real API call (`connected`, `expired`, `unconfigured`, `error`),
+  not from whether a token file exists — an expired session often just returns an empty
+  library instead of an error.
+
+| Service | Best path | Fallback | Watch out for |
+|---|---|---|---|
+| Spotify | OAuth (authorization code + PKCE) with your own developer app | `sp_dc` web-player cookie | SongMirror reports that development-mode apps get `403` when reading or changing playlist *tracks*, though listing and renaming work. Re-check this first: it decides whether Spotify writes need the cookie path. ISRCs only come from the official `/tracks` endpoint |
+| TIDAL | Official OAuth 2.1 + PKCE; anyone can create an app | — | Keep scopes minimal; test every playlist operation |
+| YouTube Music | Google OAuth **device flow** ("TVs and Limited Input" client) via `ytmusicapi` | Browser cookie headers | Unofficial API; can break |
+| Apple Music | MusicKit JS authorization (needs a paid Apple Developer account for the developer token) | Paste the web player's bearer + `media-user-token` | No subscription means catalog-only access |
+| Deezer | OAuth with an approved app | `refresh-token` cookie | New app registrations were closed as of Aug 2026 |
+| Qobuz, Amazon Music | Partner access only | Web-session tokens | Terms forbid unofficial clients; treat as later or never |
+| Files and public links | No account needed | — | Read and import only |
+
+### Secret handling
+
+- Tokens and cookies are account credentials. Store them owner-only (`0600`), or in the OS
+  keychain when available. Never log them, put them in URLs or show them in the UI after
+  they're entered.
+- Keep only the minimal values a connector needs (one cookie, one header), never a full
+  cookie jar or copied request.
+- **Disconnect** deletes everything stored for that account and revokes the OAuth grant
+  where the service supports it.
+- Don't handle passwords: login, MFA and CAPTCHAs always happen on the service's own page.
 
 ## Proposed architecture
 
-- **Connectors**: one module per service implementing the same interface
+- **Connectors**: one module per service (auth kind + capabilities, see Account linking) implementing the same interface
   (`list_playlists`, `get_tracks`, `search`, `create_playlist`, `delete_playlist`,
   `add_tracks`, `remove_tracks`, `reorder`, `rename`).
 - **Library store**: local SQLite with tracks, service IDs, playlists, snapshots,
@@ -140,8 +169,26 @@ the same regardless of service.
 6. Sync, including sync-by-name rules, with dry-run.
 7. Local web UI with the pending-changes queue and undo button.
 
-## Prior art to learn from
+## Prior art and credits
 
 Soundiiz, TuneMyMusic, SongShift and Free Your Music do transfers as hosted (mostly paid)
 services with few organizing tools. Segue aims to be open source, local-first and focused on
 ongoing library cleanup and sync rather than one-off transfers.
+
+**[SongMirror](https://github.com/ahnafnafee/songmirror)** by Ahnaf An Nafee (MIT) is a
+self-hosted, open-source sync tool for many services, and the closest project to Segue.
+Several ideas here come from its design and research. Credit for them goes to SongMirror:
+
+- the connector protocol of auth kinds plus per-account capability sets;
+- checking connection status with a live call instead of trusting a stored token;
+- its per-service research on how competitors connect accounts, and what is and isn't
+  possible in a browser;
+- the secret-handling rules above.
+
+Segue's focus is different: bulk organizing (merge, dedupe, delete and rename by rule),
+mandatory backups, a review-before-apply queue and undo. Where the projects overlap, the
+plan is to contribute back rather than compete.
+
+## License
+
+[MIT](LICENSE)
