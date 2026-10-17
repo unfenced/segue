@@ -51,71 +51,29 @@ identical playlist is skipped instead of duplicated. Imports only touch Segue's 
 so they apply right away in either mode, but they are logged: an import that replaced a
 playlist can be undone.
 
-## Goals
+How changes work today: in commit mode a change waits in a queue until `segue commit`, and
+undo also works after a commit. Step 3 changes this to the staged model described in the spec:
+changes show up right away, undo works only until you commit, and commit is final.
 
-1. **Connect** several services at once.
-2. **Edit** playlists in one interface: reorder, rename, remove, bulk-select.
-3. **Merge** playlists, within one service or across services, with duplicate removal.
-4. **Clean up** the library: duplicates, dead or unavailable tracks, empty or near-identical
-   playlists, inconsistent names, bulk deletes.
-5. **Sync** playlists across services, one-way (mirror) or two-way — individually or by rule.
-6. **Never lose anything**: mandatory backup before the first write, a review step, and undo.
+## What Segue will do
 
-## Safety model
+The full feature spec, with open questions, is in **[docs/spec.md](docs/spec.md)**. In short:
 
-Playlists are personal and often irreplaceable, so every write goes through the same pipeline.
-
-### 1. Backup first
-
-Before Segue makes its first change to a connected service, it requires a full export of
-that service's playlists (CSV, plus JSON with every service ID). This step can't be skipped.
-After that, Segue takes a fresh snapshot before each batch of changes.
-
-### 2. Apply mode: auto or commit
-
-Every action (merge, delete, sync, rename) is turned into a list of **planned operations**
-first. The user chooses how those are applied:
-
-- **Commit mode (default):** operations wait in a pending queue. The user reviews the diff
-  ("+14 tracks to *Road trip* on Spotify, delete 3 playlists") and commits all of it, part
-  of it, or none.
-- **Auto mode:** operations are applied right away, but still logged and undoable.
-
-Each user action becomes one **batch** of operations (create, delete, edit, add, remove,
-reorder). In commit mode, a batch records the revision of every playlist it touches. If one
-of those playlists changes before you commit, the batch is refused as **stale** rather than
-applied to positions that no longer mean the same thing.
-
-### 3. Undo
-
-Every applied operation stores a **snapshot** of its playlist before and after. Undo writes
-the "before" back, but only if the playlist still matches "after". So an undo never silently
-overwrites a later change: Segue names the later batch to undo first. Redo works the same
-way in reverse. Undo and redo work per batch, by default the most recent one.
-
-Snapshots also make undo exact: positions, "added" dates and each entry's service ID come
-back as they were, and a deleted playlist returns under its old library ID.
-
-Limits once real services are connected:
-- A playlist deleted on a service comes back with a **new ID**, so its followers, share link
-  and collaborators are lost. Segue warns about this before a delete.
-- Tracks removed and re-added on a service get a new "date added" there.
-
-## Batch tools
-
-Doing things one playlist at a time is what makes every service painful. Segue works on
-whole selections and on **rules**:
-
-- **Merge by name:** "merge all playlists with the same name" on one service (or across
-  all of them). Tracks are deduplicated through the neutral track model.
-- **Sync by name:** one rule — "keep every playlist whose name matches on Spotify and Tidal
-  in sync" — instead of setting up each sync by hand. New playlists that match get picked up
-  automatically.
-- **Bulk delete / rename:** select by filter (empty, under N tracks, name pattern,
-  not touched since a date, near-duplicate of another playlist).
-
-Name matching is normalized (case, whitespace, emoji, trailing "(1)" / "copy"), and the
-matched groups are shown for review before anything happens.
+1. **Organize first.** Bulk delete, rename, merge (also "merge everything with the same
+   name"), remove duplicates, split, sort, clone, and find things like "which playlists
+   contain this track". Every tool works on a selection or rule and shows a preview.
+2. **You decide what a duplicate is**: the exact same track, the same recording, or the same
+   song in any version. Asked during setup, changeable in settings.
+3. **Never lose anything.** A CSV/JSON backup is required before the first change to a
+   service, and Segue asks for a fresh one before anything that deletes playlists. Backups
+   can be uploaded again to restore.
+4. **Safe mode by default.** Changes are staged, so you can undo and redo until you commit.
+   Auto mode writes each change right away.
+5. **Your playlists vs. followed ones**, and **Liked songs** as one collection everywhere,
+   translated per service (a collection on Spotify, a favorite tag on Qobuz).
+6. **Later: transfers and sync rules.** Copy and sync across services, with deletions
+   propagating, followed playlists excludable, and unmatched tracks kept greyed out instead
+   of dropped.
 
 ## Core idea: a neutral track model
 
@@ -150,7 +108,7 @@ Every connector declares **how** it connects and **what** the connection allows:
 
 | Service | Best path | Fallback | Watch out for |
 |---|---|---|---|
-| Spotify | OAuth (authorization code + PKCE) with your own developer app | `sp_dc` web-player cookie | SongMirror reports that development-mode apps get `403` when reading or changing playlist *tracks*, though listing and renaming work. Re-check this first: it decides whether Spotify writes need the cookie path. ISRCs only come from the official `/tracks` endpoint |
+| Spotify | OAuth (authorization code + PKCE) with your own developer app | `sp_dc` web-player cookie | Since Feb 2026, development-mode apps allow 5 users, which is fine for personal use. SongMirror reports that they get `403` when reading or changing playlist *tracks*, though listing and renaming work. Re-check this first: it decides whether Spotify writes need the cookie path. ISRCs only come from the official `/tracks` endpoint |
 | TIDAL | Official OAuth 2.1 + PKCE; anyone can create an app | — | Keep scopes minimal; test every playlist operation |
 | YouTube Music | Google OAuth **device flow** ("TVs and Limited Input" client) via `ytmusicapi` | Browser cookie headers | Unofficial API; can break |
 | Apple Music | MusicKit JS authorization (needs a paid Apple Developer account for the developer token) | Paste the web player's bearer + `media-user-token` | No subscription means catalog-only access |
@@ -186,19 +144,30 @@ Every connector declares **how** it connects and **what** the connection allows:
 
 ## Build order (working plan)
 
+Organizing comes first; transfers and sync come after.
+
 1. ✅ Neutral model + SQLite store + CSV/JSON/M3U import/export (this is also the backup).
 2. ✅ Planned operations, operation log and undo, applied to Segue's own library.
-3. Spotify connector (read, then write) behind the mandatory backup gate.
-4. Cleanup and batch tools: duplicates, merge by name, bulk delete, with previews.
-5. Second connector (YouTube Music or Apple Music) + cross-service matching.
-6. Sync, including sync-by-name rules, with dry-run.
-7. Local web UI with the pending-changes queue and undo button.
+3. **Safety rework:** staged changes with undo until commit, commit as the final step, and
+   backup tracking with a prompt before deletes. Also restore from a backup, the
+   duplicate-definition setting (asked on first run), and followed/owned playlists plus Liked
+   songs in the model.
+4. **Organizing tools** on the local library: merge by name, bulk delete and rename by filter,
+   sort, split, clone, find, and the "Needs a look" list.
+5. **Spotify connector:** read playlists (created and followed) and Liked Songs; commit staged
+   changes by editing in place, so followers and links survive; detect conflicts before
+   writing.
+6. **Local web UI**: organizing hundreds of playlists needs a visual interface, not just a CLI.
+7. Second connector, cross-service matching, and transfers, including Liked songs.
+8. Sync rules.
 
 ## Prior art and credits
 
 Soundiiz, TuneMyMusic, SongShift and Free Your Music do transfers as hosted (mostly paid)
 services with few organizing tools. Segue aims to be open source, local-first and focused on
-ongoing library cleanup and sync rather than one-off transfers.
+ongoing library cleanup and sync rather than one-off transfers. The spec has a
+[comparison table](docs/spec.md#what-other-tools-do-oct-2026), including
+[spotify-dedup](https://github.com/JMPerez/spotify-dedup) and Skiley.
 
 **[SongMirror](https://github.com/ahnafnafee/songmirror)** by Ahnaf An Nafee (MIT) is a
 self-hosted, open-source sync tool for many services, and the closest project to Segue.
@@ -208,7 +177,10 @@ Several ideas here come from its design and research. Credit for them goes to So
 - checking connection status with a live call instead of trusting a stored token;
 - its per-service research on how competitors connect accounts, and what is and isn't
   possible in a browser;
-- the secret-handling rules above.
+- the secret-handling rules above;
+- modelling Liked songs as one collection with a single internal key, translated per service;
+- sync guards: capped removals, skipping a pass after a suspiciously short read, and never
+  deleting a track just because it has no match.
 
 Segue's focus is different: bulk organizing (merge, dedupe, delete and rename by rule),
 mandatory backups, a review-before-apply queue and undo. Where the projects overlap, the
