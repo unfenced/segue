@@ -18,8 +18,11 @@ Steps 1–4 are done (see the build order below):
 - the organizing tools: merge by name, bulk delete and rename by filter, sort, shuffle, split,
   clone, find, and `check` (the "Needs a look" list).
 
-There are no service connectors yet, so changes apply to Segue's own library. You can
-already import playlist exports from other tools, such as [Exportify](https://exportify.net)
+Step 5 has started: Segue can log in to Spotify with your own developer app
+(`segue spotify connect`), and `segue spotify probe` tests what that app may read and change.
+See **[docs/spotify.md](docs/spotify.md)** for the setup. Reading your Spotify library into
+Segue and writing commits back come next. Until then, changes apply to Segue's own library;
+you can import playlist exports from other tools, such as [Exportify](https://exportify.net)
 CSVs for Spotify, and clean them up.
 
 ```bash
@@ -142,7 +145,7 @@ Every connector declares **how** it connects and **what** the connection allows:
 
 | Service | Best path | Fallback | Watch out for |
 |---|---|---|---|
-| Spotify | OAuth (authorization code + PKCE) with your own developer app | `sp_dc` web-player cookie | Since Feb 2026, development-mode apps allow 5 users, which is fine for personal use. SongMirror reports that they get `403` when reading or changing playlist *tracks*, though listing and renaming work. Re-check this first: it decides whether Spotify writes need the cookie path. ISRCs only come from the official `/tracks` endpoint |
+| Spotify | OAuth (authorization code + PKCE) with your own developer app; see **[docs/spotify.md](docs/spotify.md)** | `sp_dc` web-player cookie, only if the official API falls short | Since Feb 2026: up to 5 users, the app owner needs Premium, and the playlist endpoints moved to `/playlists/{id}/items` and `/me/playlists`. The old ones are gone, which likely explains the `403`s SongMirror saw. Tracks of playlists you only *follow* can't be read. Playlist reads include ISRCs |
 | TIDAL | Official OAuth 2.1 + PKCE; anyone can create an app | — | Keep scopes minimal; test every playlist operation |
 | YouTube Music | Google OAuth **device flow** ("TVs and Limited Input" client) via `ytmusicapi` | Browser cookie headers | Unofficial API; can break |
 | Apple Music | MusicKit JS authorization (needs a paid Apple Developer account for the developer token) | Paste the web player's bearer + `media-user-token` | No subscription means catalog-only access |
@@ -191,9 +194,9 @@ Organizing comes first; transfers and sync come after.
    songs in the model.
 4. ✅ **Organizing tools** on the local library: merge by name, bulk delete and rename by filter,
    sort, split, clone, find, and the "Needs a look" list.
-5. **Spotify connector:** read playlists (created and followed) and Liked Songs; commit staged
-   changes by editing in place, so followers and links survive; detect conflicts before
-   writing.
+5. **Spotify connector** (in progress): ✅ login and the `probe` command; next, read
+   playlists (created and followed) and Liked Songs into Segue, commit staged changes by editing
+   in place, so followers and links survive, and detect conflicts before writing.
 6. **Local web UI**: organizing hundreds of playlists needs a visual interface, not just a CLI.
 7. Second connector, cross-service matching, and transfers, including Liked songs.
 8. Sync rules.

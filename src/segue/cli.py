@@ -10,6 +10,7 @@ from pathlib import Path
 from . import __version__, analysis, backup, changes, dupes, edits, select
 from .formats import FORMATS, csv_format, detect_format, json_format, m3u_format, read_playlists
 from .model import Playlist, normalize
+from .connectors import spotify, spotify_probe
 from .ops import DeletePlaylist
 from .store import Store, default_db_path
 
@@ -195,6 +196,23 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("check", help="list what needs a look: empty, duplicate and overlapping playlists")
     p.set_defaults(func=cmd_check)
 
+    p = sub.add_parser("spotify", help="connect to Spotify (see docs/spotify.md)")
+    spotify_sub = p.add_subparsers(dest="spotify_command", required=True)
+    s = spotify_sub.add_parser("connect", help="log in to Spotify with your own developer app")
+    s.add_argument("--client-id", help="your app's Client ID (default: the one used last time)")
+    s.add_argument("--port", type=int, default=spotify.DEFAULT_PORT,
+                   help=f"port of the redirect URI http://127.0.0.1:PORT/callback (default {spotify.DEFAULT_PORT})")
+    s.add_argument("--no-browser", action="store_true", help="print the login link instead of opening it")
+    s.set_defaults(func=cmd_spotify_connect)
+    s = spotify_sub.add_parser("status", help="show whether Segue is connected to Spotify")
+    s.set_defaults(func=cmd_spotify_status)
+    s = spotify_sub.add_parser("disconnect", help="delete the stored Spotify login")
+    s.set_defaults(func=cmd_spotify_disconnect)
+    s = spotify_sub.add_parser("probe", help="test what your Spotify app may read and change")
+    s.add_argument("--read-only", action="store_true", help="skip the tests that change playlists")
+    s.add_argument("--yes", action="store_true", help="run the change tests without asking")
+    s.set_defaults(func=cmd_spotify_probe)
+
     p = change_parser("restore", "put playlists back as they are in a backup file")
     p.add_argument("file", type=Path)
     p.add_argument("--format", choices=FORMATS, help="override detection by file extension")
@@ -236,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         with Store(db_path) as store:
             args.db_path = db_path
             return args.func(store, args) or 0
-    except (ValueError, KeyError, OSError, changes.ChangeError) as e:
+    except (ValueError, KeyError, OSError, changes.ChangeError, spotify.SpotifyError) as e:
         print(f"segue: {e.args[0] if isinstance(e, KeyError) else e}", file=sys.stderr)
         return 1
 
@@ -470,6 +488,67 @@ def cmd_check(store: Store, args) -> int:
             print(f"  fix: {finding.fix}")
     print("\nUnavailable tracks will show up here once a service is connected.")
     return 0
+
+
+# Spotify
+
+def _spotify_tokens(args) -> spotify.TokenStore:
+    return spotify.TokenStore(Path(args.db_path).parent / "spotify.json")
+
+
+def cmd_spotify_connect(store: Store, args) -> int:
+    tokens = _spotify_tokens(args)
+    client_id = args.client_id or (tokens.load() or {}).get("client_id")
+    if not client_id:
+        raise ValueError("pass --client-id (from your app's settings on developer.spotify.com; see docs/spotify.md)")
+    import webbrowser
+
+    me = spotify.connect(tokens, client_id, args.port, None if args.no_browser else webbrowser.open)
+    print(f"connected to Spotify as {me.get('display_name') or me['id']}. "
+          f"The login is stored in {tokens.path} (only you can read it).")
+    print("next: segue spotify probe")
+    return 0
+
+
+def cmd_spotify_status(store: Store, args) -> int:
+    tokens = _spotify_tokens(args)
+    data = tokens.load()
+    if not data:
+        print("not connected. See docs/spotify.md, then run: segue spotify connect --client-id ID")
+        return 0
+    me = spotify.SpotifyClient(tokens).me()
+    print(f"connected as {me.get('display_name') or me['id']} with app {data['client_id']}")
+    granted = set((data.get("scope") or "").split())
+    missing = [s for s in spotify.SCOPES if s not in granted]
+    if missing:
+        print(f"missing permissions: {', '.join(missing)}. Run: segue spotify connect")
+    return 0
+
+
+def cmd_spotify_disconnect(store: Store, args) -> int:
+    if _spotify_tokens(args).clear():
+        print("deleted the stored Spotify login. To revoke it completely, remove the app under "
+              "'Manage apps' on your Spotify account page.")
+    else:
+        print("not connected")
+    return 0
+
+
+def cmd_spotify_probe(store: Store, args) -> int:
+    client = spotify.SpotifyClient(_spotify_tokens(args))
+    write = not args.read_only
+    if write and not args.yes:
+        question = (f"The change tests create a private playlist {spotify_probe.TEST_NAME!r} on your account "
+                    "and delete it again at the end. Run them? [y/N] ")
+        if not _interactive():
+            print("not in a terminal: running the read tests only (add --yes to include the change tests)")
+            write = False
+        else:
+            write = input(question).strip().lower() in ("y", "yes")
+    marks = {"ok": "✓", "no": "✗", "skipped": "–", "error": "!"}
+    checks = spotify_probe.probe(client, write, report=lambda c: print(f"{marks[c.result]} {c.name}: {c.detail}"))
+    print(spotify_probe.summary(checks))
+    return 1 if any(c.result == "error" for c in checks) else 0
 
 
 def cmd_restore(store: Store, args) -> int:
