@@ -17,7 +17,7 @@ def make_track(title="Song", artists=("Artist",), **kw) -> Track:
 @pytest.fixture
 def sample_playlists() -> list[Playlist]:
     a = make_track("Hey Jude", ["The Beatles"], album="Hey Jude", duration_ms=431000,
-                   isrc="GBAYE0601690",
+                   isrc="GBAYE0601690", release_date="1968-08-26",
                    refs=[ServiceRef("spotify", "0aym2LBJBk9DAYuHHutrIl")])
     b = make_track("Tyler's Song", ["Tyler, The Creator", "Frank Ocean"], duration_ms=200500,
                    refs=[ServiceRef("tidal", "12345", "https://tidal.com/browse/track/12345")])

@@ -16,7 +16,7 @@ from .model import (
     EntryState, Playlist, PlaylistEntry, PlaylistState, ServiceRef, Track, normalize, normalize_isrc,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Two durations further apart than this mean two different recordings.
 DURATION_TOLERANCE_MS = 3000
@@ -30,7 +30,8 @@ CREATE TABLE tracks (
     duration_ms  INTEGER,
     isrc         TEXT,
     norm_title   TEXT NOT NULL,
-    norm_artists TEXT NOT NULL
+    norm_artists TEXT NOT NULL,
+    release_date TEXT
 );
 CREATE INDEX tracks_isrc ON tracks(isrc);
 CREATE INDEX tracks_key ON tracks(norm_title, norm_artists);
@@ -188,6 +189,7 @@ UPDATE batches SET status = 'committed' WHERE status = 'applied';
 UPDATE settings SET value = 'safe' WHERE key = 'apply_mode' AND value = 'commit';
 UPDATE settings SET value = 'auto' WHERE key = 'apply_mode' AND value NOT IN ('safe', 'auto');
 """ + _BACKUP_SCHEMA,
+    4: "ALTER TABLE tracks ADD COLUMN release_date TEXT;",
 }
 
 
@@ -280,18 +282,19 @@ class Store:
         if existing is None:
             title, artists = track.match_key()
             cur = self.db.execute(
-                "INSERT INTO tracks (title, artists, album, duration_ms, isrc, norm_title, norm_artists)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO tracks (title, artists, album, duration_ms, isrc, norm_title, norm_artists,"
+                " release_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (track.title, json.dumps(track.artists), track.album, track.duration_ms,
-                 track.isrc, title, artists),
+                 track.isrc, title, artists, track.release_date),
             )
             track_id = cur.lastrowid
         else:
             track_id = existing
             self.db.execute(
                 "UPDATE tracks SET isrc = COALESCE(isrc, ?), album = COALESCE(album, ?),"
-                " duration_ms = COALESCE(duration_ms, ?) WHERE id = ?",
-                (track.isrc, track.album, track.duration_ms, track_id),
+                " duration_ms = COALESCE(duration_ms, ?), release_date = COALESCE(release_date, ?)"
+                " WHERE id = ?",
+                (track.isrc, track.album, track.duration_ms, track.release_date, track_id),
             )
         for ref in track.refs:
             self.db.execute(
@@ -346,6 +349,7 @@ class Store:
                 tracks[row["id"]] = Track(
                     id=row["id"], title=row["title"], artists=json.loads(row["artists"]),
                     album=row["album"], duration_ms=row["duration_ms"], isrc=row["isrc"],
+                    release_date=row["release_date"],
                 )
             for row in self.db.execute(
                 f"SELECT * FROM track_refs WHERE track_id IN ({marks}) ORDER BY service", chunk

@@ -82,7 +82,7 @@ def test_changes_build_on_staged_changes(store):
     do(store, edits.plan_rename(store, a, "Both"))
     assert titles(store, a) == ["x", "y", "z"] and store.get_playlist(a).name == "Both"
     assert changes.describe_staged(store) == [
-        "'Both': renamed from 'A', +1 track", "delete 'B' (2 tracks)",
+        f"#{a} 'Both': renamed from 'A', +1 track", f"#{b} delete 'B' (2 tracks)",
     ]
 
 

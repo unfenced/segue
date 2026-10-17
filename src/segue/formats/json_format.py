@@ -44,6 +44,7 @@ def to_dict(playlists: list[Playlist], library_id: str | None = None) -> dict:
                         "album": e.track.album,
                         "duration_ms": e.track.duration_ms,
                         "isrc": e.track.isrc,
+                        "release_date": e.track.release_date,
                         "refs": [_ref_to_dict(r) for r in e.track.refs],
                         "added_at": e.added_at,
                     }
@@ -70,6 +71,7 @@ def from_dict(data: dict) -> list[Playlist]:
                     album=t.get("album"),
                     duration_ms=t.get("duration_ms"),
                     isrc=t.get("isrc"),
+                    release_date=t.get("release_date"),
                     refs=[_ref_from_dict(r) for r in t.get("refs") or []],
                 ),
                 t.get("added_at"),

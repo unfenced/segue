@@ -3,7 +3,7 @@
 Segue writes these columns:
 
     playlist, playlist_description, playlist_kind, playlist_service, playlist_id, playlist_url,
-    segue_id, position, title, artists, album, duration_ms, isrc, added_at,
+    segue_id, position, title, artists, album, duration_ms, isrc, release_date, added_at,
     <service>_id, <service>_url   (one pair per service that appears, e.g. spotify_id)
 
 Artists are separated by "; ". A playlist with no tracks is written as a single row with
@@ -27,7 +27,8 @@ ARTIST_SEPARATOR = "; "
 
 _FIXED_COLUMNS = [
     "playlist", "playlist_description", "playlist_kind", "playlist_service", "playlist_id",
-    "playlist_url", "segue_id", "position", "title", "artists", "album", "duration_ms", "isrc", "added_at",
+    "playlist_url", "segue_id", "position", "title", "artists", "album", "duration_ms", "isrc",
+    "release_date", "added_at",
 ]
 
 # Accepted header spellings (after lower-casing and trimming) for each field.
@@ -46,6 +47,7 @@ _ALIASES = {
     "duration_ms": {"duration_ms", "duration (ms)", "duration ms"},
     "duration": {"duration", "length", "time"},
     "isrc": {"isrc"},
+    "release_date": {"release_date", "release date", "released", "year"},
     "added_at": {"added_at", "added at", "date added", "added"},
     "link": {"track uri", "spotify uri", "uri", "url", "link", "track url", "spotify url"},
 }
@@ -82,6 +84,7 @@ def write(playlists: list[Playlist], path: Path, library_id: str | None = None) 
                     "album": t.album or "",
                     "duration_ms": "" if t.duration_ms is None else t.duration_ms,
                     "isrc": t.isrc or "",
+                    "release_date": t.release_date or "",
                     "added_at": entry.added_at or "",
                 }
                 # One ID per service fits in a row; the first is the entry's own.
@@ -211,6 +214,7 @@ def _track(row: dict[str, str]) -> Track:
         album=row.get("album") or None,
         duration_ms=duration,
         isrc=row.get("isrc") or None,
+        release_date=row.get("release_date") or None,
         refs=list(refs.values()),
     )
 

@@ -7,7 +7,7 @@ import re
 import sys
 from pathlib import Path
 
-from . import __version__, backup, changes, dupes, edits
+from . import __version__, analysis, backup, changes, dupes, edits, select
 from .formats import FORMATS, csv_format, detect_format, json_format, m3u_format, read_playlists
 from .model import Playlist, normalize
 from .ops import DeletePlaylist
@@ -50,7 +50,24 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("folder", type=Path, nargs="?", help="default: a 'backups' folder next to the library")
     p.set_defaults(func=cmd_backup)
 
-    p = sub.add_parser("list", help="list playlists")
+    def filter_flags(p):
+        g = p.add_argument_group("filters (combine freely)")
+        g.add_argument("--name", metavar="PATTERN", help="names matching a pattern, e.g. 'gym*' (case-insensitive)")
+        g.add_argument("--regex", action="store_true", help="treat --name as a regular expression")
+        g.add_argument("--empty", action="store_true", help="playlists without tracks")
+        g.add_argument("--min-tracks", type=int, metavar="N")
+        g.add_argument("--max-tracks", type=int, metavar="N")
+        g.add_argument("--kind", action="append", default=[], choices=["created", "collaborative", "followed", "liked"],
+                       help="only this kind (default: created and collaborative); repeatable")
+        g.add_argument("--service", help="only playlists from this service ('local' for imported files)")
+        g.add_argument("--identical", action="store_true",
+                       help="newer copies of a playlist with exactly the same tracks (the oldest is left out)")
+        g.add_argument("--subset", action="store_true", help="playlists whose tracks are all in a bigger one")
+        g.add_argument("--include-followed", action="store_true",
+                       help="also include followed playlists (when matching by name or filter)")
+
+    p = sub.add_parser("list", help="list playlists (all, or those matching filters)")
+    filter_flags(p)
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("show", help="show a playlist's tracks")
@@ -76,19 +93,15 @@ def main(argv: list[str] | None = None) -> int:
         group.add_argument("--no-backup", action="store_true",
                            help="delete even if there is no backup of the current version")
 
-    def followed_flag(p):
-        p.add_argument("--include-followed", action="store_true",
-                       help="also match followed playlists when selecting by name")
-
     p = change_parser("rename", "rename a playlist")
     p.add_argument("playlist", help="ID or name")
     p.add_argument("name", help="new name")
     p.set_defaults(func=cmd_rename)
 
     p = change_parser("delete", "delete playlists (unfollow, for followed ones)")
-    p.add_argument("playlists", nargs="+", help="IDs or names")
+    p.add_argument("playlists", nargs="*", help="IDs or names (or choose with filters)")
     backup_flags(p)
-    followed_flag(p)
+    filter_flags(p)
     p.set_defaults(func=cmd_delete)
 
     p = change_parser("remove", "remove tracks from a playlist by position")
@@ -97,10 +110,10 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_remove)
 
     p = change_parser("dedupe", "remove duplicate tracks from playlists")
-    p.add_argument("playlists", nargs="+", help="IDs or names")
+    p.add_argument("playlists", nargs="*", help="IDs or names (or choose with filters)")
     p.add_argument("--duplicates", choices=dupes.LEVELS, help="override the duplicate setting")
     p.add_argument("--keep", choices=dupes.KEEPS, help="override which copy is kept")
-    followed_flag(p)
+    filter_flags(p)
     p.set_defaults(func=cmd_dedupe)
 
     p = change_parser("merge", "merge playlists without duplicate tracks")
@@ -110,9 +123,77 @@ def main(argv: list[str] | None = None) -> int:
     target.add_argument("--new", metavar="NAME", help="create a new playlist with this name")
     p.add_argument("--delete-sources", action="store_true", help="delete the merged-in playlists")
     p.add_argument("--duplicates", choices=dupes.LEVELS, help="override the duplicate setting")
+    p.add_argument("--include-followed", action="store_true",
+                   help="also match followed playlists when selecting by name")
     backup_flags(p)
-    followed_flag(p)
     p.set_defaults(func=cmd_merge)
+
+    p = change_parser("merge-names", "merge every group of playlists that share a name (per service)")
+    p.add_argument("playlists", nargs="*", help="limit to these IDs or names (default: all)")
+    p.add_argument("--survivor", choices=edits.SURVIVORS, default="oldest",
+                   help="which playlist of each group is kept (default: oldest)")
+    p.add_argument("--keep-sources", action="store_true", help="don't delete the merged-in playlists")
+    p.add_argument("--duplicates", choices=dupes.LEVELS, help="override the duplicate setting")
+    backup_flags(p)
+    filter_flags(p)
+    p.set_defaults(func=cmd_merge_names)
+
+    p = change_parser("rename-all", "rename many playlists by rules")
+    p.add_argument("playlists", nargs="*", help="IDs or names (or choose with filters)")
+    rules = p.add_argument_group("rules (applied in this order)")
+    rules.add_argument("--replace", nargs=2, action="append", default=[], metavar=("OLD", "NEW"),
+                       help="replace text; repeatable")
+    rules.add_argument("--replace-regex", nargs=2, action="append", default=[], metavar=("PATTERN", "NEW"),
+                       help="replace a regular expression; repeatable")
+    rules.add_argument("--strip-copies", action="store_true", help="remove trailing '(1)', '(copy)', '- copy'")
+    rules.add_argument("--trim", action="store_true", help="remove extra spaces")
+    rules.add_argument("--case", choices=edits.CASES)
+    rules.add_argument("--prefix", default="")
+    rules.add_argument("--suffix", default="")
+    filter_flags(p)
+    p.set_defaults(func=cmd_rename_all)
+
+    p = change_parser("sort", "sort a playlist's tracks")
+    p.add_argument("playlist", help="ID or name")
+    p.add_argument("--by", required=True, metavar="KEY[,KEY]",
+                   help=f"one or more of: {', '.join(edits.SORT_KEYS)} (e.g. artist,album)")
+    p.add_argument("--reverse", action="store_true")
+    p.add_argument("--as-new", metavar="NAME", help="save the result as a new playlist instead")
+    p.set_defaults(func=cmd_sort)
+
+    p = change_parser("shuffle", "shuffle a playlist's tracks")
+    p.add_argument("playlist", help="ID or name")
+    p.add_argument("--seed", type=int, help="repeatable shuffle")
+    p.add_argument("--as-new", metavar="NAME", help="save the result as a new playlist instead")
+    p.set_defaults(func=cmd_shuffle)
+
+    p = change_parser("split", "split a playlist into several")
+    p.add_argument("playlist", help="ID or name")
+    how = p.add_mutually_exclusive_group(required=True)
+    how.add_argument("--every", type=int, metavar="N", help="a new playlist every N tracks")
+    how.add_argument("--by", choices=edits.SPLIT_BY)
+    p.add_argument("--min", type=int, default=1, metavar="N",
+                   help="with --by: groups smaller than N go together into '<name> – other'")
+    p.add_argument("--delete-original", action="store_true")
+    backup_flags(p)
+    p.set_defaults(func=cmd_split)
+
+    p = change_parser("clone", "copy a playlist")
+    p.add_argument("playlist", help="ID or name")
+    p.add_argument("--name", help="name of the copy (default: '<name> (copy)')")
+    p.set_defaults(func=cmd_clone)
+
+    p = sub.add_parser("find", help="find where tracks are, loose tracks, or overlapping playlists")
+    p.add_argument("query", nargs="?", help="words from a title or artist")
+    p.add_argument("--no-playlist", action="store_true", help="library tracks that are in no playlist")
+    p.add_argument("--liked-only", action="store_true", help="liked songs that are in no other playlist")
+    p.add_argument("--overlaps", action="store_true", help="playlists that are copies or subsets of others")
+    p.add_argument("--min-ratio", type=float, default=analysis.SIMILAR_DEFAULT,
+                   help="with --overlaps: how much two playlists must share (default 0.8)")
+    p.set_defaults(func=cmd_find)
+
+    p = sub.add_parser("check", help="list what needs a look: empty, duplicate and overlapping playlists")
+    p.set_defaults(func=cmd_check)
 
     p = change_parser("restore", "put playlists back as they are in a backup file")
     p.add_argument("file", type=Path)
@@ -231,6 +312,13 @@ def cmd_list(store: Store, args) -> int:
     if not summaries:
         print("No playlists yet. Add some with: segue import <file>")
         return 0
+    f = _filter(args)
+    if f.is_set():
+        chosen = set(select.apply_filter(store, [s.id for s in summaries], f))
+        summaries = [s for s in summaries if s.id in chosen]
+        if not summaries:
+            print("no playlists match")
+            return 0
     width = max(len(s.name) for s in summaries)
     kinds = {s.id: "" if s.kind == "created" else s.kind for s in summaries}
     kind_width = max(len(k) for k in kinds.values())
@@ -263,8 +351,7 @@ def cmd_rename(store: Store, args) -> int:
 
 
 def cmd_delete(store: Store, args) -> int:
-    ids = _ids(store, args.playlists, args.include_followed)
-    return _submit(store, args, edits.plan_delete(store, ids))
+    return _submit(store, args, edits.plan_delete(store, _pick(store, args)))
 
 
 def cmd_remove(store: Store, args) -> int:
@@ -274,8 +361,7 @@ def cmd_remove(store: Store, args) -> int:
 def cmd_dedupe(store: Store, args) -> int:
     if not args.duplicates:
         _ensure_duplicate_setting(store)
-    ids = _ids(store, args.playlists, args.include_followed)
-    return _submit(store, args, edits.plan_dedupe(store, ids, args.duplicates, args.keep))
+    return _submit(store, args, edits.plan_dedupe(store, _pick(store, args), args.duplicates, args.keep))
 
 
 def cmd_merge(store: Store, args) -> int:
@@ -286,6 +372,104 @@ def cmd_merge(store: Store, args) -> int:
                             into_name=args.new, delete_sources=args.delete_sources,
                             level=args.duplicates)
     return _submit(store, args, plan)
+
+
+def cmd_merge_names(store: Store, args) -> int:
+    if not args.duplicates:
+        _ensure_duplicate_setting(store)
+    ids = _pick(store, args, default_all=True)
+    description, ops, groups = edits.plan_merge_by_name(
+        store, ids, args.survivor, delete_sources=not args.keep_sources, level=args.duplicates)
+    if not groups:
+        print("no playlists share a name")
+        return 0
+    print("groups (kept playlist ← merged in):")
+    for kept, others in groups:
+        print(f"  {kept!r} ← {', '.join(map(repr, others))}")
+    return _submit(store, args, (description, ops))
+
+
+def cmd_rename_all(store: Store, args) -> int:
+    rules = edits.RenameRules(
+        replace=[(old, new, False) for old, new in args.replace]
+        + [(old, new, True) for old, new in args.replace_regex],
+        trim=args.trim, case=args.case, strip_copies=args.strip_copies,
+        prefix=args.prefix, suffix=args.suffix,
+    )
+    if not (rules.replace or rules.trim or rules.case or rules.strip_copies or rules.prefix or rules.suffix):
+        raise ValueError("give at least one rule, e.g. --trim or --replace OLD NEW")
+    return _submit(store, args, edits.plan_bulk_rename(store, _pick(store, args), rules))
+
+
+def cmd_sort(store: Store, args) -> int:
+    keys = [k.strip() for k in args.by.split(",") if k.strip()]
+    return _submit(store, args, edits.plan_sort(store, _one(store, args.playlist), keys, args.reverse, args.as_new))
+
+
+def cmd_shuffle(store: Store, args) -> int:
+    return _submit(store, args, edits.plan_shuffle(store, _one(store, args.playlist), args.seed, args.as_new))
+
+
+def cmd_split(store: Store, args) -> int:
+    plan = edits.plan_split(store, _one(store, args.playlist), every=args.every, by=args.by,
+                            min_size=args.min, delete_original=args.delete_original)
+    return _submit(store, args, plan)
+
+
+def cmd_clone(store: Store, args) -> int:
+    return _submit(store, args, edits.plan_clone(store, _one(store, args.playlist), args.name))
+
+
+def cmd_find(store: Store, args) -> int:
+    modes = [bool(args.query), args.no_playlist, args.liked_only, args.overlaps]
+    if sum(modes) != 1:
+        raise ValueError("give words to search for, or one of --no-playlist, --liked-only, --overlaps")
+    if args.query:
+        hits = analysis.where(store, args.query)
+        if not hits:
+            print(f"no tracks match {args.query!r}")
+        for hit in hits:
+            print(f"{_label(hit.track)}")
+            if not hit.places:
+                print("    in no playlist")
+            for pid, name, positions in hit.places:
+                print(f"    {name!r} (#{pid}) at {', '.join(map(str, positions))}")
+    elif args.no_playlist or args.liked_only:
+        tracks = analysis.liked_unplaylisted(store) if args.liked_only else analysis.unplaylisted(store)
+        what = "liked songs in no other playlist" if args.liked_only else "tracks in no playlist"
+        print(f"{len(tracks)} {what}")
+        for track in tracks:
+            print(f"    {_label(track)}")
+    else:
+        names = {s.id: s.name for s in store.playlist_summaries()}
+        found = analysis.overlaps(store, min_ratio=args.min_ratio)
+        if not found:
+            print("no overlapping playlists")
+        for o in found:
+            if o.kind == "subset":
+                print(f"{names[o.a]!r} (#{o.a}) is entirely inside {names[o.b]!r} (#{o.b}): {o.shared} tracks")
+            else:
+                print(f"{names[o.a]!r} (#{o.a}) and {names[o.b]!r} (#{o.b}) are {o.kind}: "
+                      f"{o.shared} shared tracks, {o.ratio:.0%}")
+    return 0
+
+
+def cmd_check(store: Store, args) -> int:
+    findings = analysis.check(store)
+    if not findings:
+        print("Needs a look: nothing. The library looks tidy.")
+        return 0
+    print("Needs a look:")
+    for finding in findings:
+        print(f"\n* {finding.title}")
+        for line in finding.lines[:10]:
+            print(f"    {line}")
+        if len(finding.lines) > 10:
+            print(f"    … and {len(finding.lines) - 10} more")
+        if finding.fix:
+            print(f"  fix: {finding.fix}")
+    print("\nUnavailable tracks will show up here once a service is connected.")
+    return 0
 
 
 def cmd_restore(store: Store, args) -> int:
@@ -457,6 +641,38 @@ def _choose(question: str, options: dict[str, str], default: str) -> str:
             return keys[int(answer) - 1]
         if answer in options:
             return answer
+
+
+def _filter(args) -> select.Filter:
+    kinds = set(getattr(args, "kind", []) or [])
+    if getattr(args, "include_followed", False):
+        kinds |= {"created", "collaborative", "followed"}
+    return select.Filter(
+        name=getattr(args, "name", None), regex=getattr(args, "regex", False),
+        empty=getattr(args, "empty", False), min_tracks=getattr(args, "min_tracks", None),
+        max_tracks=getattr(args, "max_tracks", None), kinds=kinds,
+        service=getattr(args, "service", None), identical=getattr(args, "identical", False),
+        subset=getattr(args, "subset", False),
+    )
+
+
+def _pick(store: Store, args, default_all: bool = False) -> list[int]:
+    """Playlists named on the command line, narrowed by any filters; or all that pass the filters."""
+    f = _filter(args)
+    if args.playlists:
+        ids = _ids(store, args.playlists, include_followed=bool(f.kinds - {"created", "collaborative"}))
+        return select.apply_filter(store, ids, f) if f.is_set() else ids
+    if not f.is_set() and not default_all:
+        raise ValueError("name some playlists, or choose them with a filter such as --empty or --name")
+    ids = select.apply_filter(store, [s.id for s in store.playlist_summaries()], f)
+    if not ids:
+        raise ValueError("no playlists match the filters")
+    return ids
+
+
+def _label(track) -> str:
+    artists = ", ".join(track.artists)
+    return f"{artists} - {track.title}" if artists else track.title
 
 
 def _ids(store: Store, selectors: list[str], include_followed: bool = False) -> list[int]:

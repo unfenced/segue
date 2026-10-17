@@ -11,7 +11,7 @@ def summary(playlists):
         (
             p.name, p.description, p.source,
             [
-                (t.title, t.artists, t.album, t.duration_ms, t.isrc,
+                (t.title, t.artists, t.album, t.duration_ms, t.isrc, t.release_date,
                  sorted((r.service, r.id) for r in t.refs), e.added_at)
                 for e in p.entries
                 for t in [e.track]

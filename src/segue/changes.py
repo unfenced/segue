@@ -151,8 +151,9 @@ def staged_changes(store: Store) -> list[tuple[int, PlaylistState | None, Playli
 
 
 def describe_staged(store: Store) -> list[str]:
+    """One line per playlist that a commit will change, with its ID."""
     label = track_label(store)
-    return [describe_change(old, new, label) for _, old, new in staged_changes(store)]
+    return [f"#{pid} {describe_change(old, new, label)}" for pid, old, new in staged_changes(store)]
 
 
 # Applying

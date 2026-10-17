@@ -6,7 +6,7 @@ so switching away from Spotify (or any other service) takes minutes, not weekend
 
 ## Status
 
-Steps 1–3 are done (see the build order below):
+Steps 1–4 are done (see the build order below):
 
 - the neutral track library, the SQLite store, and JSON/CSV/M3U import and export;
 - the change log, with safe mode (staged, undo until commit) and auto mode (applied at once,
@@ -14,7 +14,9 @@ Steps 1–3 are done (see the build order below):
 - backups that Segue keeps track of, a backup check before anything deletes playlists, and
   restoring from a CSV or JSON backup;
 - the duplicate setting (exact, same recording, same song in any version);
-- playlist kinds: created, collaborative, followed and Liked songs.
+- playlist kinds: created, collaborative, followed and Liked songs;
+- the organizing tools: merge by name, bulk delete and rename by filter, sort, shuffle, split,
+  clone, find, and `check` (the "Needs a look" list).
 
 There are no service connectors yet, so changes apply to Segue's own library. You can
 already import playlist exports from other tools, such as [Exportify](https://exportify.net)
@@ -41,12 +43,33 @@ uv run segue commit                             # final: no undo after this (or:
 uv run segue restore ~/.segue/backups/segue-backup-2026-10-17_120000.csv -p Gym
 uv run segue history
 uv run segue config                             # apply-mode, duplicates, keep, undo-limit
+
+uv run segue check                              # "Needs a look", with a command to fix each item
+uv run segue merge-names                        # merge every group of same-named playlists
+uv run segue delete --empty                     # or --identical, --max-tracks 3, --name "test*"
+uv run segue list --subset                      # filters work on list too, to see what they pick
+uv run segue rename-all --name "*road*" --trim --case title --strip-copies
+uv run segue sort Gym --by artist,title         # or --by release --reverse; --as-new "Gym sorted"
+uv run segue shuffle Gym --as-new "Gym shuffled"
+uv run segue split "Liked Songs" --by decade --min 10
+uv run segue clone Gym                          # "Gym (copy)"
+uv run segue find "hey jude"                    # which playlists contain it, at which positions
+uv run segue find --overlaps                    # playlists that are copies or subsets of others
+uv run segue find --liked-only                  # liked songs in no other playlist
 uv run pytest
 ```
 
 Commands that change playlists take `--now` (apply right away), `--stage` (stage for commit)
-or `--dry-run` (only show the preview). Commands that select playlists by name skip followed
-playlists unless you add `--include-followed`.
+or `--dry-run` (only show the preview). Commands that pick several playlists accept names or
+IDs, filters (`--name`, `--empty`, `--min-tracks`, `--max-tracks`, `--kind`, `--service`,
+`--identical`, `--subset`), or both. Followed playlists and Liked songs are left out unless you
+add `--include-followed` or `--kind`.
+
+Playlists count as having the same name when they match ignoring case, spacing, emoji and a
+trailing "(1)", "(copy)" or "- copy"; "Gym 2" stays separate. Merging happens per service, and
+the playlist kept is the oldest in the library (`--survivor largest` keeps the biggest).
+Clones are named "<name> (copy)", so `merge-names` would fold them back in; split parts
+("<name> – part 1") are left alone.
 
 The library lives at `~/.segue/segue.db`; override it with `--db` or `SEGUE_DB`.
 
@@ -166,7 +189,7 @@ Organizing comes first; transfers and sync come after.
    backup tracking with a prompt before deletes. Also restore from a backup, the
    duplicate-definition setting (asked on first run), and followed/owned playlists plus Liked
    songs in the model.
-4. **Organizing tools** on the local library: merge by name, bulk delete and rename by filter,
+4. ✅ **Organizing tools** on the local library: merge by name, bulk delete and rename by filter,
    sort, split, clone, find, and the "Needs a look" list.
 5. **Spotify connector:** read playlists (created and followed) and Liked Songs; commit staged
    changes by editing in place, so followers and links survive; detect conflicts before

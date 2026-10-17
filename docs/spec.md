@@ -62,6 +62,12 @@ What the service shows depends on why the track doesn't match:
 
 Every tool works on a selection or a rule, shows a preview first, and follows the apply mode.
 
+**Built** (step 4): bulk delete and rename by filter, merge and merge by name, split, clone,
+remove duplicates, sort and shuffle, finding tracks and overlaps, and the "Needs a look" list.
+**Not yet:** empty, replace, moving or copying selected tracks, the Liked-songs tools, the
+"not changed since" filter (needs dates from a service), and unavailable tracks in "Needs a
+look" (needs a connected service).
+
 **Playlists**
 - **Delete** in bulk, selected by filter: empty, fewer than N tracks, name pattern, not
   changed since a date, the same as another playlist. For followed playlists this means
@@ -70,7 +76,8 @@ Every tool works on a selection or a rule, shows a preview first, and follows th
 - **Merge into an existing playlist** (Soundiiz "merge") or **into a new one** (Soundiiz
   "join"), with duplicates removed according to the duplicate setting. Merging into an existing
   playlist keeps its link, followers and creation date. So when merging duplicates by name,
-  the default survivor is the playlist with the most followers, or the oldest.
+  the default survivor is the oldest playlist, or the biggest (`--survivor largest`). Once
+  services are connected, the one with the most followers should win.
 - **Merge by name**: group the playlists that have the same normalized name (on one service, or
   per service), review the groups, and merge each group into one. Normalizing ignores case,
   spacing, emoji, and a trailing "(1)" or "copy".

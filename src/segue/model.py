@@ -29,6 +29,7 @@ class Track:
     isrc: str | None = None
     refs: list[ServiceRef] = field(default_factory=list)
     id: int | None = None  # library ID, set once stored
+    release_date: str | None = None  # "YYYY", "YYYY-MM" or "YYYY-MM-DD", as the source gives it
 
     def ref(self, service: str) -> ServiceRef | None:
         return next((r for r in self.refs if r.service == service), None)

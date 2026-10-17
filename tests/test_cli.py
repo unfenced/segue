@@ -140,3 +140,42 @@ def test_followed_playlists_are_skipped_by_name(tmp_path, capsys):
     assert "skipping followed playlist 'Gym'" in capsys.readouterr().out
     run(tmp_path, "list")
     assert "followed" in capsys.readouterr().out
+
+
+def test_organizing_commands(tmp_path, capsys):
+    from segue.model import Playlist, PlaylistEntry
+    from .conftest import make_track
+
+    source = tmp_path / "in.json"
+    json_format.write([
+        Playlist("Gym", [PlaylistEntry(make_track("A")), PlaylistEntry(make_track("B"))]),
+        Playlist("gym (1)", [PlaylistEntry(make_track("B")), PlaylistEntry(make_track("C"))]),
+        Playlist("Empty"),
+    ], source)
+    run(tmp_path, "import", str(source))
+    run(tmp_path, "setup", "--duplicates", "recording")
+    capsys.readouterr()
+
+    run(tmp_path, "check")
+    out = capsys.readouterr().out
+    assert "fix: segue delete --empty" in out and "fix: segue merge-names --dry-run" in out
+
+    run(tmp_path, "list", "--empty")
+    out = capsys.readouterr().out
+    assert "Empty" in out and "Gym" not in out
+
+    assert run(tmp_path, "merge-names", "--backup") == 0
+    out = capsys.readouterr().out
+    assert "'Gym' ← 'gym (1)'" in out and "staged as #" in out
+
+    assert run(tmp_path, "delete", "--empty", "--backup") == 0
+    run(tmp_path, "sort", "Gym", "--by", "title", "--reverse")
+    run(tmp_path, "show", "Gym")
+    out = capsys.readouterr().out
+    assert out.index("- C") < out.index("- B") < out.index("- A")
+
+    run(tmp_path, "find", "B")
+    assert "'Gym' (#1) at 2" in capsys.readouterr().out
+
+    assert run(tmp_path, "delete") == 1
+    assert "choose them with a filter" in capsys.readouterr().err
