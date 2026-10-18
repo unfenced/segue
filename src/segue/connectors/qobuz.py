@@ -35,7 +35,7 @@ from .common import SecretFile, Transport, urllib_transport
 API_URL = "https://www.qobuz.com/api.json/0.2"
 SERVICE = "qobuz"
 LIKED_ID = "@favorites"  # the source ID Segue gives Qobuz favorites (Liked songs)
-LIKED_NAME = "Liked songs"
+LIKED_NAME = "Qobuz favorites"  # not "Liked songs": many libraries have a playlist by that name
 PAGE = 100
 WRITE_CHUNK = 50
 MAX_RETRIES = 4
@@ -184,10 +184,20 @@ class QobuzClient:
         self.request("POST", "playlist/unsubscribe", {"playlist_id": playlist_id})
 
     def add_tracks(self, playlist_id: str, track_ids: list[str]) -> None:
-        for chunk in _chunks(track_ids):
-            self.request("POST", "playlist/addTracks", {"playlist_id": playlist_id, "track_ids": ",".join(chunk),
-                                                         "no_duplicate": "false"})
-            self.sleep(PAUSE)
+        """Append tracks. A track that appears twice goes in a later request: Qobuz can drop a
+        repeated ID within one request."""
+        remaining = list(track_ids)
+        while remaining:
+            seen: set[str] = set()
+            this_round, later = [], []
+            for track_id in remaining:
+                (later if track_id in seen else this_round).append(track_id)
+                seen.add(track_id)
+            for chunk in _chunks(this_round):
+                self.request("POST", "playlist/addTracks", {"playlist_id": playlist_id,
+                                                             "track_ids": ",".join(chunk), "no_duplicate": "false"})
+                self.sleep(PAUSE)
+            remaining = later
 
     def delete_tracks(self, playlist_id: str, playlist_track_ids: list[str]) -> None:
         for chunk in _chunks(playlist_track_ids):
@@ -281,6 +291,10 @@ class QobuzService:
         self.client = client
         self._my_id: str | None = None
 
+    def wait(self) -> None:
+        """Pause briefly, e.g. while Qobuz still serves a cached copy of a playlist."""
+        self.client.sleep(1.5)
+
     def my_id(self) -> str | None:
         if self._my_id is None:
             try:
@@ -367,10 +381,22 @@ class QobuzService:
                          "they stay in Segue's copy")
 
         # Read back to learn the new entries' IDs, then put everything in the target order.
-        _, items = self.client.playlist(remote_id)
+        # New entries are paired with target positions by track ID, in order.
+        items = self._read_settled(remote_id, expected=len(kept) + len(add_ids))
         current = [str(item.get("playlist_track_id")) for item in items]
-        new_handles = [h for h in current if h not in kept]
-        assigned = dict(zip(to_add, new_handles))
+        fresh: dict[str, list[str]] = {}
+        for item in items:
+            handle = str(item.get("playlist_track_id"))
+            if handle not in kept:
+                fresh.setdefault(str(item.get("id")), []).append(handle)
+        assigned = {}
+        for position, qobuz_id in zip(to_add, add_ids):
+            if fresh.get(qobuz_id):
+                assigned[position] = fresh[qobuz_id].pop(0)
+        missing = len(add_ids) - len(assigned)
+        if missing:
+            notes.append(f"Qobuz didn't keep {missing} of the added tracks (it may refuse a track that's "
+                         "already in the playlist)")
         desired = []
         for position, entry in enumerate(target.entries):
             if entry.handle in kept:
@@ -381,6 +407,16 @@ class QobuzService:
         if moves:
             notes.append(f"moved {moves} track{'s' if moves != 1 else ''} into place")
         return remote_id, notes
+
+    def _read_settled(self, remote_id: str, expected: int, tries: int = 3) -> list[dict]:
+        """Read a playlist, waiting briefly if Qobuz still serves the version from before the change."""
+        _, items = self.client.playlist(remote_id)
+        for _ in range(tries - 1):
+            if len(items) == expected:
+                break
+            self.client.sleep(1.5)
+            _, items = self.client.playlist(remote_id)
+        return items
 
     def _write_details(self, remote_id: str, remote: PlaylistState, target: PlaylistState) -> list[str]:
         if (remote.name, remote.description or "") == (target.name, target.description or ""):

@@ -268,10 +268,25 @@ def push(store: Store, services: dict[str, Service]) -> PushReport:
         if t.current is None:
             store.remove_remote(t.pid, t.service)
         else:
-            fresh = store.to_state(service.read_playlist(remote_id))
+            fresh = _read_settled(store, service, remote_id, t.current)
             _record_written(store, t, remote_id, fresh)
         report.written.append((_name(t), service.display, notes))
     return report
+
+
+def _read_settled(store: Store, service: Service, remote_id: str, target: PlaylistState,
+                  tries: int = 3) -> PlaylistState:
+    """Read a playlist after writing it, waiting briefly while the service still serves a cached copy."""
+    lookup = _track_ids(store, service.name)
+    fresh = store.to_state(service.read_playlist(remote_id))
+    for _ in range(tries - 1):
+        if _holdable(fresh, lookup) == _holdable(target, lookup):
+            break
+        wait = getattr(service, "wait", None)
+        if wait:
+            wait()
+        fresh = store.to_state(service.read_playlist(remote_id))
+    return fresh
 
 
 def unmatched_counts(store: Store, services: dict[str, Service]) -> list[str]:

@@ -87,7 +87,8 @@ add `--include-followed` or `--kind`.
 
 Playlists count as having the same name when they match ignoring case, spacing, emoji and a
 trailing "(1)", "(copy)" or "- copy"; "Gym 2" stays separate. Merging happens per service, and
-the playlist kept is the oldest in the library (`--survivor largest` keeps the biggest).
+the playlist kept is the one with the most tracks (`--survivor oldest` keeps the one that has been
+in Segue longest).
 Clones are named "<name> (copy)", so `merge-names` would fold them back in; split parts
 ("<name> – part 1") are left alone.
 

@@ -56,13 +56,13 @@ def test_read_library_kinds_tracks_and_favorites():
     library = qobuz.QobuzService(client(fake)).read_library()
     by_name = {p.name: p for p in library}
     assert {p.name: p.kind for p in library} == {
-        "Mine": "created", "Shared": "collaborative", "Theirs": "followed", "Liked songs": "liked"}
+        "Mine": "created", "Shared": "collaborative", "Theirs": "followed", "Qobuz favorites": "liked"}
     entries = by_name["Mine"].entries
     assert [e.track.title for e in entries] == ["Song 1", "Song 2", "Song 1"]
     assert len({e.handle for e in entries}) == 3  # each copy has its own entry ID
     assert entries[0].track.isrc == "QZ0000000001" and entries[0].track.release_date == "1991-01-01"
     assert by_name["Mine"].source.id == mine
-    assert [t.title for t in by_name["Liked songs"].tracks] == ["Song 6", "Song 5"]
+    assert [t.title for t in by_name["Qobuz favorites"].tracks] == ["Song 6", "Song 5"]
 
 
 def test_probe_reports_what_works():
@@ -72,6 +72,7 @@ def test_probe_reports_what_works():
     fake.like([5])
     checks = {c.name: c for c in qobuz_probe.probe(client(fake), write=True)}
     assert checks["List playlists"].detail == "2 playlists: 1 yours, 0 collaborative, 1 followed"
+    assert checks["Add a duplicate"].result == "ok"
     assert checks["Remove one copy"].result == "ok"
     assert checks["Move a track"].result == "ok"
     assert checks["Rename (with emoji)"].result == "ok"
@@ -93,6 +94,18 @@ def test_probe_notices_dropped_emoji_names_and_cleans_up_on_failure():
     checks = qobuz_probe.probe(client(fake), write=True)
     assert checks[-1].name == "Clean up" and checks[-1].result == "ok"
     assert [p["name"] for p in fake.playlists.values()] == ["Mine"]
+
+
+def test_probe_copes_with_cached_reads_and_refused_duplicates():
+    fake = FakeQobuz()
+    fake.add_playlist("Mine", [1, 2, 3])
+    fake.stale_reads = 1
+    fake.refuses_duplicates = True
+    checks = {c.name: c for c in qobuz_probe.probe(client(fake), write=True)}
+    assert checks["Add tracks"].result == "ok"
+    assert checks["Add a duplicate"].result == "no"
+    assert checks["Move a track"].result == "ok"
+    assert qobuz_probe.summary(list(checks.values())) == "Everything Segue needs works with this Qobuz session."
 
 
 def test_read_only_probe_writes_nothing():

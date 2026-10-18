@@ -76,7 +76,7 @@ look" (needs a connected service).
 - **Merge into an existing playlist** (Soundiiz "merge") or **into a new one** (Soundiiz
   "join"), with duplicates removed according to the duplicate setting. Merging into an existing
   playlist keeps its link, followers and creation date. So when merging duplicates by name,
-  the default survivor is the oldest playlist, or the biggest (`--survivor largest`). Once
+  the default survivor is the biggest playlist, or the oldest (`--survivor oldest`). Once
   services are connected, the one with the most followers should win.
 - **Merge by name**: group the playlists that have the same normalized name (on one service, or
   per service), review the groups, and merge each group into one. Normalizing ignores case,

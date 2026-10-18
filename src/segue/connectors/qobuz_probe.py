@@ -94,29 +94,37 @@ def probe(client: QobuzClient, write: bool, report: Callable[[Check], None] = la
         created = str(client.create_playlist(TEST_NAME, "Made by 'segue qobuz probe'. Delete it if it's still here.")["id"])
         note("Create a playlist", "ok", f"made private playlist {TEST_NAME!r}")
 
-        client.add_tracks(created, [a, b, a])
-        _, items = client.playlist(created)
+        client.add_tracks(created, [a, b])
+        items = _read(client, created, 2)
+        if [str(i["id"]) for i in items] != [a, b]:
+            note("Add tracks", "error", f"added 2 tracks, read back {len(items)}")
+            return checks
+        note("Add tracks", "ok", "added 2 tracks")
+
+        client.add_tracks(created, [a])  # the same track again, in its own request
+        items = _read(client, created, 3)
         order = [str(i["id"]) for i in items]
         handles = [str(i.get("playlist_track_id")) for i in items]
-        if order != [a, b, a] or len(set(handles)) != 3:
-            note("Add tracks", "error", f"expected 3 entries with their own IDs, read back {len(order)}")
-            return checks
-        note("Add tracks", "ok", "added 3 tracks, one of them twice; each entry has its own ID")
-
-        client.delete_tracks(created, [handles[2]])
-        _, items = client.playlist(created)
-        order = [str(i["id"]) for i in items]
-        if order == [a, b]:
-            note("Remove one copy", "ok", "removed just one copy of the duplicated track")
+        if order == [a, b, a] and len(set(handles)) == 3:
+            note("Add a duplicate", "ok", "added a track that was already there; each copy has its own entry ID")
+            client.delete_tracks(created, [handles[2]])
+            items = _read(client, created, 2)
+            if [str(i["id"]) for i in items] == [a, b]:
+                note("Remove one copy", "ok", "removed just one copy of the duplicated track")
+            else:
+                note("Remove one copy", "error", f"expected 2 tracks left, read back {len(items)}")
+        elif order == [a, b]:
+            note("Add a duplicate", "no", "Qobuz didn't add a track that was already in the playlist; "
+                                          "Segue can't create duplicates there (removing them works)")
         else:
-            note("Remove one copy", "error", f"expected 2 tracks left, read back {len(order)}")
+            note("Add a duplicate", "error", f"unexpected result: {len(order)} tracks")
 
         client.add_tracks(created, [c])
-        _, items = client.playlist(created)
+        items = _read(client, created, 3)
         dates = {str(i.get("playlist_track_id")): i.get("created_at") for i in items}
         last = str(items[-1].get("playlist_track_id"))
         client.move_tracks(created, [last], insert_before=0)
-        _, items = client.playlist(created)
+        items = _read(client, created, 3, lambda its: str(its[0]["id"]) == c if its else False)
         order = [str(i["id"]) for i in items]
         if order != [c, a, b]:
             note("Move a track", "error", "the order after moving wasn't what was asked for")
@@ -150,6 +158,17 @@ def probe(client: QobuzClient, write: bool, report: Callable[[Check], None] = la
             except QobuzError as e:
                 note("Clean up", "error", f"couldn't delete {TEST_NAME!r}; please delete it yourself ({e})")
     return checks
+
+
+def _read(client: QobuzClient, playlist_id: str, count: int, done=None, tries: int = 4) -> list[dict]:
+    """Read the test playlist, waiting briefly if Qobuz still serves an older (cached) version."""
+    _, items = client.playlist(playlist_id)
+    for _ in range(tries - 1):
+        if len(items) == count and (done is None or done(items)):
+            break
+        client.sleep(1.5)
+        _, items = client.playlist(playlist_id)
+    return items
 
 
 def summary(checks: list[Check]) -> str:

@@ -131,8 +131,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p = change_parser("merge-names", "merge every group of playlists that share a name (per service)")
     p.add_argument("playlists", nargs="*", help="limit to these IDs or names (default: all)")
-    p.add_argument("--survivor", choices=edits.SURVIVORS, default="oldest",
-                   help="which playlist of each group is kept (default: oldest)")
+    p.add_argument("--survivor", choices=edits.SURVIVORS, default="largest",
+                   help="which playlist of each group is kept (default: the one with the most tracks)")
     p.add_argument("--keep-sources", action="store_true", help="don't delete the merged-in playlists")
     p.add_argument("--duplicates", choices=dupes.LEVELS, help="override the duplicate setting")
     filter_flags(p)

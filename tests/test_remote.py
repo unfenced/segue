@@ -43,7 +43,7 @@ def test_pull_brings_in_the_library(store, fake, service):
     ids = pulled(store, service)
     assert store.get_playlist(ids["Gym"]).source.service == "qobuz"
     assert {s.name: s.kind for s in store.playlist_summaries()} == {
-        "Gym": "created", "Theirs": "followed", "Liked songs": "liked"}
+        "Gym": "created", "Theirs": "followed", "Qobuz favorites": "liked"}
     assert remote.last_pull(store, "qobuz")
     assert remote.pending_pushes(store, {"qobuz": service}) == []
 
@@ -86,6 +86,21 @@ def test_dedupe_removes_only_the_extra_copy(store, fake, service):
     assert fake.tracks_of(gym) == ["1", "2", "3"]
     assert fake.entries_of(gym)[0] is kept_entry  # same entry, same date added
     assert remote.pending_pushes(store, {"qobuz": service}) == []
+
+
+def test_adding_a_duplicate_and_reading_through_the_cache(store, fake, service):
+    mix = fake.add_playlist("Mix", [1, 2])
+    other = fake.add_playlist("Other", [1, 3])
+    ids = pulled(store, service)
+    fake.stale_reads = 1
+    do(store, edits.plan_merge(store, [ids["Other"]], into_id=ids["Mix"], level="exact"))  # adds 3 only
+    entry = store.playlist_state(ids["Other"]).entries[0]
+    from segue.ops import AddEntries
+    changes.submit(store, "add a copy", [AddEntries(ids["Mix"], (entry,), position=0)])
+    fake.stale_reads = 2  # the read-back after the moves is cached too
+    push(store, service)
+    assert fake.tracks_of(mix) == ["1", "1", "2", "3"]
+    assert remote.pending_pushes(store, {"qobuz": service}) == []  # no false difference left behind
 
 
 def test_merge_and_delete_sources(store, fake, service):
@@ -164,7 +179,7 @@ def test_liked_songs_become_favorites(store, fake, service):
     fake.add_playlist("Mix", [1, 2])
     fake.like([3])
     ids = pulled(store, service)
-    do(store, edits.plan_merge(store, [ids["Mix"]], into_id=ids["Liked songs"]))
+    do(store, edits.plan_merge(store, [ids["Mix"]], into_id=ids["Qobuz favorites"]))
     push(store, service)
     assert sorted(str(t["id"]) for t in fake.favorites) == ["1", "2", "3"]
 

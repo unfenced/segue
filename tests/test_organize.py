@@ -84,7 +84,7 @@ def test_merge_by_name_per_service(store):
 def test_merge_by_name_largest_survivor_and_keep_sources(store):
     add(store, "Run", "A")
     big = add(store, "run", "B", "C", "D")
-    _, ops, groups = edits.plan_merge_by_name(store, ids(store), survivor="largest", delete_sources=False)
+    _, ops, groups = edits.plan_merge_by_name(store, ids(store), delete_sources=False)
     assert groups == [("run", ["Run"])]
     do(store, ("merge", ops))
     assert titles(store, big) == ["B", "C", "D", "A"]
@@ -216,7 +216,7 @@ def test_check_reports_and_suggests_fixes(store):
     findings = {f.title: f.fix for f in analysis.check(store)}
     assert findings["1 empty playlist"] == "segue delete --empty"
     assert findings["1 name used by more than one playlist"] == "segue merge-names --dry-run"
-    assert findings["1 pair of playlists with the same tracks"] == "segue delete --identical --dry-run"
+    assert findings["1 pair of differently named playlists with the same tracks"] == "segue delete --identical --dry-run"
     assert any(t.startswith("1 playlist with duplicates") for t in findings)
 
 
@@ -225,6 +225,16 @@ def test_check_doesnt_repeat_what_merge_names_covers(store):
     add(store, "Gym 💪", "a")
     titles_ = [f.title for f in analysis.check(store)]
     assert titles_ == ["1 name used by more than one playlist"]
+
+
+def test_check_groups_overlaps_of_copies(store):
+    big = add(store, "Big", "a", "b", "c", "d")
+    add(store, "Big", "a", "b", "c", "d")
+    add(store, "Small", "a")
+    add(store, "Small", "a")
+    findings = {f.title: f for f in analysis.check(store)}
+    inside = findings["1 playlist entirely inside another"]
+    assert inside.lines == ["'Small' (1 track) is entirely inside 'Big'"]
 
 
 def test_tidy_library_has_nothing_to_report(store):

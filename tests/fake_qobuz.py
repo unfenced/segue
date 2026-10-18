@@ -27,6 +27,10 @@ class FakeQobuz:
         self.fail: dict[str, int] = {}  # endpoint -> HTTP status
         self.calls: list[tuple[str, str, dict]] = []
         self.rate_limit_next = 0
+        self.refuses_duplicates = False  # never add a track that's already in the playlist
+        self.stale_reads = 0  # serve this many cached (pre-change) reads after each change
+        self._cache: dict[str, list] = {}
+        self._stale_left = 0
 
     @staticmethod
     def _track(n: int) -> dict:
@@ -101,8 +105,12 @@ class FakeQobuz:
         pl = self.playlists.get(p["playlist_id"])
         if pl is None:
             return self._json(404, {"status": "error", "code": 404, "message": "Playlist not found"})
+        entries = pl["entries"]
+        if self._stale_left and p["playlist_id"] in self._cache:
+            self._stale_left -= 1
+            entries = self._cache[p["playlist_id"]]
         rows = [{**e["track"], "playlist_track_id": e["playlist_track_id"], "created_at": e["created_at"]}
-                for e in pl["entries"]]
+                for e in entries]
         data = json.loads(self._page("tracks", rows, p)[2])
         return self._json(200, self._summary(pl) | data)
 
@@ -133,16 +141,28 @@ class FakeQobuz:
         return self._json(200, {"status": "success"})
 
     def _playlist_addTracks(self, p):
-        self._append(p["playlist_id"], p["track_ids"].split(","))
+        self._remember(p["playlist_id"])
+        ids, seen = [], {str(e["track"]["id"]) for e in self.playlists[p["playlist_id"]]["entries"]}
+        for t in p["track_ids"].split(","):
+            if t in ids or (self.refuses_duplicates and t in seen):
+                continue  # like Qobuz: a repeated ID within one request is dropped
+            ids.append(t)
+        self._append(p["playlist_id"], ids)
         return self._json(200, self._summary(self.playlists[p["playlist_id"]]))
 
+    def _remember(self, pid):
+        self._cache[pid] = list(self.playlists[pid]["entries"])
+        self._stale_left = self.stale_reads
+
     def _playlist_deleteTracks(self, p):
+        self._remember(p["playlist_id"])
         drop = set(p["playlist_track_ids"].split(","))
         pl = self.playlists[p["playlist_id"]]
         pl["entries"] = [e for e in pl["entries"] if str(e["playlist_track_id"]) not in drop]
         return self._json(200, self._summary(pl))
 
     def _playlist_updateTracksPosition(self, p):
+        self._remember(p["playlist_id"])
         pl = self.playlists[p["playlist_id"]]
         ids = p["playlist_track_ids"].split(",")
         moving = [e for e in pl["entries"] if str(e["playlist_track_id"]) in ids]

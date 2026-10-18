@@ -148,31 +148,25 @@ def check(store: Store) -> list[Finding]:
             "segue merge-names --dry-run",
         ))
 
-    # Pairs in the same name group are already handled by merge-names; don't report them twice.
-    same_name = {pid: n for n, g in enumerate(groups) for pid in g}
-    found = [
-        o for o in overlaps(store, editable)
-        if same_name.get(o.a, -1) != same_name.get(o.b, -2)
-    ]
+    # Copies of one playlist (same name) count once: merge-names handles them, and reporting
+    # each copy separately would repeat every finding.
+    rep = {pid: g[0] for g in groups for pid in g}
+    seen: set[tuple] = set()
+    found = []
+    for o in overlaps(store, editable):
+        a, b = rep.get(o.a, o.a), rep.get(o.b, o.b)
+        if a == b or (a, b, o.kind) in seen or (b, a, o.kind) in seen:
+            continue
+        seen.add((a, b, o.kind))
+        found.append(o)
+
     identical = [o for o in found if o.kind == "identical"]
     if identical:
         findings.append(Finding(
-            f"{len(identical)} pair{'s' if len(identical) != 1 else ''} of playlists with the same tracks",
+            f"{len(identical)} pair{'s' if len(identical) != 1 else ''} of differently named playlists "
+            "with the same tracks",
             [f"{name[o.a]!r} and {name[o.b]!r} ({o.shared} tracks)" for o in identical],
             "segue delete --identical --dry-run",
-        ))
-    for o in [o for o in found if o.kind == "subset"]:
-        findings.append(Finding(
-            f"{name[o.a]!r} is entirely inside {name[o.b]!r}",
-            [f"all {o.shared} of its tracks are in {name[o.b]!r}"],
-            f"segue merge {o.a} --into {o.b} --delete-sources --dry-run",
-        ))
-    similar = [o for o in found if o.kind == "similar"]
-    if similar:
-        findings.append(Finding(
-            f"{len(similar)} pair{'s' if len(similar) != 1 else ''} of nearly identical playlists",
-            [f"{name[o.a]!r} and {name[o.b]!r} share {o.ratio:.0%} ({o.shared} tracks)" for o in similar],
-            f"segue merge {similar[0].b} --into {similar[0].a} --dry-run",
         ))
 
     level, keep = dupes.level(store), dupes.keep(store)
@@ -187,5 +181,30 @@ def check(store: Store) -> list[Finding]:
             f"{len(with_dupes)} playlist{'s' if len(with_dupes) != 1 else ''} with duplicates ({level})",
             [f"{name[pid]!r}: {n} duplicate{'s' if n != 1 else ''}" for pid, n in with_dupes],
             "segue dedupe " + " ".join(str(pid) for pid, _ in with_dupes) + " --dry-run",
+        ))
+
+    inside: dict[int, list[int]] = {}
+    for o in found:
+        if o.kind == "subset":
+            inside.setdefault(o.a, []).append(o.b)
+    if inside:
+        lines = []
+        for small, bigs in sorted(inside.items(), key=lambda kv: -len(store.playlist_state(kv[0]).entries)):
+            size = len(store.playlist_state(small).entries)
+            where = list(dict.fromkeys(name[b] for b in bigs))
+            shown = ", ".join(repr(n) for n in where[:3]) + (f" and {len(where) - 3} more" if len(where) > 3 else "")
+            lines.append(f"{name[small]!r} ({size} track{'s' if size != 1 else ''}) is entirely inside {shown}")
+        findings.append(Finding(
+            f"{len(inside)} playlist{'s' if len(inside) != 1 else ''} entirely inside another",
+            lines,
+            "segue find --overlaps   (then: segue merge SMALL --into BIG --delete-sources)",
+        ))
+
+    similar = [o for o in found if o.kind == "similar"]
+    if similar:
+        findings.append(Finding(
+            f"{len(similar)} pair{'s' if len(similar) != 1 else ''} of nearly identical playlists",
+            [f"{name[o.a]!r} and {name[o.b]!r} share {o.ratio:.0%} ({o.shared} tracks)" for o in similar],
+            f"segue merge {similar[0].b} --into {similar[0].a} --dry-run",
         ))
     return findings

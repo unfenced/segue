@@ -130,20 +130,20 @@ def plan_merge(
 
 # Merge by name
 
-SURVIVORS = ("oldest", "largest")
+SURVIVORS = ("largest", "oldest")
 
 
 def plan_merge_by_name(
     store: Store,
     playlist_ids: list[int],
-    survivor: str = "oldest",
+    survivor: str = "largest",
     delete_sources: bool = True,
     level: str | None = None,
 ) -> tuple[str, list[Operation], list[tuple[str, list[str]]]]:
     """Merge each group of same-named playlists (per service) into one.
 
-    The survivor is the oldest playlist in the group (it has been in the library longest),
-    or the one with the most tracks. Returns ``(description, ops, groups)`` where groups
+    The survivor is the playlist with the most tracks (fewest changes, so the most tracks keep
+    their date added), or the one that has been in Segue's library longest. Returns ``(description, ops, groups)`` where groups
     lists each survivor's name and the names merged into it.
     """
     if survivor not in SURVIVORS:
