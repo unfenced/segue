@@ -213,7 +213,7 @@ def test_qobuz_pull_organize_commit(tmp_path, capsys, monkeypatch):
     run(tmp_path, "config", "apply-mode", "auto")
     capsys.readouterr()
     assert run(tmp_path, "rename", "Gym", "Gym 2") == 1
-    assert "no backup since you last pulled from qobuz" in capsys.readouterr().err.lower()
+    assert "no backup since you last read your library from qobuz" in capsys.readouterr().err.lower()
     assert fake.playlists[gym]["name"] == "Gym"
     assert run(tmp_path, "rename", "Gym", "Gym 2", "--backup") == 0
     assert fake.playlists[gym]["name"] == "Gym 2"

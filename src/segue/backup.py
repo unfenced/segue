@@ -12,7 +12,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .formats import csv_format, json_format
-from .model import Playlist
+from dataclasses import replace
+
+from .model import Playlist, PlaylistState
 from .ops import Operation, RestorePlaylist
 from .store import Store
 
@@ -81,13 +83,36 @@ def plan_restore(store: Store, playlists: list[Playlist]) -> tuple[str, list[Ope
         state = store.to_state(playlist)
         if target is not None:
             claimed.add(target)
-            if store.playlist_state(target) == state:
-                notes.append(f"{playlist.name!r} is already as in the backup")
-                continue
+            current = store.playlist_state(target)
+            if current is not None:
+                state = _keep_entry_ids(state, current)
+                if current.content() == state.content():
+                    notes.append(f"{playlist.name!r} is already as in the backup")
+                    continue
         ops.append(RestorePlaylist(target, state))
     names = [p.name for p in playlists]
     shown = ", ".join(repr(n) for n in names[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")
     return f"restore {shown} from backup", ops, notes
+
+
+def _keep_entry_ids(restored: PlaylistState, current: PlaylistState) -> PlaylistState:
+    """Give restored entries the service entry IDs (and dates) of matching current entries.
+
+    Backups don't hold the services' own entry IDs. Without them, writing a restore would
+    remove and re-add every track; with them, only what really differs changes.
+    """
+    pool: dict[int, list] = {}
+    for entry in current.entries:
+        pool.setdefault(entry.track_id, []).append(entry)
+    entries = []
+    for entry in restored.entries:
+        match = pool.get(entry.track_id)
+        if match:
+            old = match.pop(0)
+            entry = replace(entry, handle=old.handle, added_at=entry.added_at or old.added_at,
+                            ref_service=entry.ref_service or old.ref_service, ref_id=entry.ref_id or old.ref_id)
+        entries.append(entry)
+    return replace(restored, entries=tuple(entries), source=restored.source or current.source)
 
 
 def _match(store: Store, playlist: Playlist, claimed: set[int]) -> int | None:

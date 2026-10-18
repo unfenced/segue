@@ -4,6 +4,29 @@ One place to manage playlists across music streaming services: connect accounts,
 see every playlist side by side, clean them up, merge them, and keep them in sync —
 so switching away from Spotify (or any other service) takes minutes, not weekends.
 
+## Opening Segue
+
+**Double-click `Segue.command`** in this folder. A Terminal window opens and Segue opens in
+your browser at `http://127.0.0.1:8790`. Keep the window open while you use Segue; close it to
+stop. Everything runs on your computer. The first start takes a little longer while uv sets
+things up inside this folder (in `.venv`); nothing else on your computer changes.
+
+Needs [uv](https://docs.astral.sh/uv/). From a terminal, the same thing is `uv run segue ui`.
+
+In the interface:
+
+- **Library:** search and filter your playlists, tick some, and choose Merge, Remove
+  duplicates, Rename, Copy or Delete. "Merge all same-named playlists" does the big cleanup in
+  one go. Click a playlist to see its tracks, sort, shuffle, split or remove tracks.
+- **Needs a look:** what's worth tidying, with a Fix button on each item.
+- **Changes:** what's staged and what a commit will write to Qobuz; Commit, Discard, history.
+  Undo and Redo are always in the top bar.
+- **Services:** connect Qobuz, read your library, test the connection.
+- **Settings:** safe or auto mode, what counts as a duplicate, where new playlists show up,
+  backups and restoring from them.
+
+Every action shows a preview first, and Segue asks for a backup whenever one is needed.
+
 ## Status
 
 Steps 1–4 are done (see the build order below):
@@ -199,7 +222,8 @@ Every connector declares **how** it connects and **what** the connection allows:
   handle rate limits and partial failures (resume, or roll back the part that was written).
 - **Backups** (`backup.py`): writes backups, records which version of each playlist they
   hold, and plans restores.
-- **Interface**: start with a CLI, then a local web UI.
+- **Interface**: a CLI (`cli.py`) and a local web interface (`web/`), both on top of the same
+  actions (`actions.py`).
 
 ## Build order (working plan)
 
@@ -217,7 +241,9 @@ Organizing comes first; transfers and sync come after.
    checks, a backup before the first write after a pull, and destinations for new playlists.
    ✅ Spotify login with a developer app and its probe. Next: **Spotify through the web player's
    session cookie** (no Premium needed), with the same pull and commit.
-6. **Local web UI**: organizing hundreds of playlists needs a visual interface, not just a CLI.
+6. ✅ **Local web interface** (`segue ui`, or double-click `Segue.command`): library, playlist
+   pages, Needs a look, changes and undo, services and settings. It listens on 127.0.0.1 only,
+   and every request needs a token that only the page Segue served carries.
 7. Second connector, cross-service matching, and transfers, including Liked songs.
 8. Sync rules.
 

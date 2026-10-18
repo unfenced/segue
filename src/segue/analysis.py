@@ -6,7 +6,7 @@ Nothing here changes the library; each finding comes with the command that would
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import dupes, select
 from .model import Track, normalize
@@ -122,7 +122,9 @@ def overlaps(store: Store, ids: list[int] | None = None, min_ratio: float = SIMI
 class Finding:
     title: str
     lines: list[str]
-    fix: str | None = None
+    fix: str | None = None  # the command to run
+    action: dict | None = None  # the same fix, for the interface: {"action": ..., "params": ...}
+    line_actions: list[dict | None] = field(default_factory=list)  # a fix per line, where there is one
 
 
 def check(store: Store) -> list[Finding]:
@@ -138,6 +140,7 @@ def check(store: Store) -> list[Finding]:
             f"{len(empty)} empty playlist{'s' if len(empty) != 1 else ''}",
             [repr(s.name) for s in empty],
             "segue delete --empty",
+            {"action": "delete", "params": {"ids": [s.id for s in empty]}},
         ))
 
     groups = select.name_groups(store, editable)
@@ -146,6 +149,8 @@ def check(store: Store) -> list[Finding]:
             f"{len(groups)} name{'s' if len(groups) != 1 else ''} used by more than one playlist",
             [", ".join(f"{name[pid]!r} (#{pid})" for pid in g) for g in groups],
             "segue merge-names --dry-run",
+            {"action": "merge_names", "params": {}},
+            [{"action": "merge_names", "params": {"ids": g}} for g in groups],
         ))
 
     # Copies of one playlist (same name) count once: merge-names handles them, and reporting
@@ -167,6 +172,8 @@ def check(store: Store) -> list[Finding]:
             "with the same tracks",
             [f"{name[o.a]!r} and {name[o.b]!r} ({o.shared} tracks)" for o in identical],
             "segue delete --identical --dry-run",
+            {"action": "delete", "params": {"filter": {"identical": True}}},
+            [{"action": "delete", "params": {"ids": [max(o.a, o.b)]}} for o in identical],
         ))
 
     level, keep = dupes.level(store), dupes.keep(store)
@@ -181,6 +188,8 @@ def check(store: Store) -> list[Finding]:
             f"{len(with_dupes)} playlist{'s' if len(with_dupes) != 1 else ''} with duplicates ({level})",
             [f"{name[pid]!r}: {n} duplicate{'s' if n != 1 else ''}" for pid, n in with_dupes],
             "segue dedupe " + " ".join(str(pid) for pid, _ in with_dupes) + " --dry-run",
+            {"action": "dedupe", "params": {"ids": [pid for pid, _ in with_dupes]}},
+            [{"action": "dedupe", "params": {"ids": [pid]}} for pid, _ in with_dupes],
         ))
 
     inside: dict[int, list[int]] = {}
@@ -188,8 +197,10 @@ def check(store: Store) -> list[Finding]:
         if o.kind == "subset":
             inside.setdefault(o.a, []).append(o.b)
     if inside:
-        lines = []
+        lines, line_actions = [], []
         for small, bigs in sorted(inside.items(), key=lambda kv: -len(store.playlist_state(kv[0]).entries)):
+            line_actions.append({"action": "merge", "params": {"ids": [small], "into_id": bigs[0],
+                                                               "delete_sources": True}})
             size = len(store.playlist_state(small).entries)
             where = list(dict.fromkeys(name[b] for b in bigs))
             shown = ", ".join(repr(n) for n in where[:3]) + (f" and {len(where) - 3} more" if len(where) > 3 else "")
@@ -198,6 +209,8 @@ def check(store: Store) -> list[Finding]:
             f"{len(inside)} playlist{'s' if len(inside) != 1 else ''} entirely inside another",
             lines,
             "segue find --overlaps   (then: segue merge SMALL --into BIG --delete-sources)",
+            None,
+            line_actions,
         ))
 
     similar = [o for o in found if o.kind == "similar"]
@@ -206,5 +219,7 @@ def check(store: Store) -> list[Finding]:
             f"{len(similar)} pair{'s' if len(similar) != 1 else ''} of nearly identical playlists",
             [f"{name[o.a]!r} and {name[o.b]!r} share {o.ratio:.0%} ({o.shared} tracks)" for o in similar],
             f"segue merge {similar[0].b} --into {similar[0].a} --dry-run",
+            None,
+            [{"action": "merge", "params": {"ids": [o.b], "into_id": o.a, "delete_sources": True}} for o in similar],
         ))
     return findings

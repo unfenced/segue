@@ -215,3 +215,23 @@ def test_destinations_setting(store, fake, service):
     do(store, edits.plan_clone(store, store.playlist_summaries()[0].id))
     report = remote.push(store, {"qobuz": service})
     assert report.ok and report.skipped == ["'A (copy)' waits for spotify to be connected"]
+
+
+def test_restoring_a_backup_changes_only_what_differs(store, fake, service, tmp_path):
+    from segue import backup
+    from segue.formats import json_format
+
+    mix = fake.add_playlist("Mix", [1, 2, 3])
+    dates = [e["created_at"] for e in fake.entries_of(mix)]
+    ids = pulled(store, service)
+    json_format.write(store.all_playlists(), tmp_path / "b.json", store.library_id)
+    do(store, edits.plan_remove(store, ids["Mix"], [2]))
+    push(store, service)
+    changes.commit(store)
+    remote.pull(store, service)
+    _, ops, _ = backup.plan_restore(store, json_format.read(tmp_path / "b.json"))
+    changes.submit(store, "restore", ops)
+    push(store, service)
+    assert fake.tracks_of(mix) == ["1", "2", "3"]
+    kept = [e["created_at"] for e in fake.entries_of(mix)]
+    assert kept[0] == dates[0] and kept[2] == dates[2]  # tracks that stayed weren't re-added

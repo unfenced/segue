@@ -7,7 +7,7 @@ import re
 import sys
 from pathlib import Path
 
-from . import __version__, analysis, backup, changes, dupes, edits, remote, select
+from . import __version__, actions, analysis, backup, changes, dupes, edits, remote, select
 from .formats import FORMATS, csv_format, detect_format, json_format, m3u_format, read_playlists
 from .model import Playlist, normalize
 from .connectors import qobuz, qobuz_probe, spotify, spotify_probe
@@ -206,6 +206,11 @@ def main(argv: list[str] | None = None) -> int:
     s.set_defaults(func=cmd_spotify_status)
     s = spotify_sub.add_parser("disconnect", help="delete the stored Spotify login")
     s.set_defaults(func=cmd_spotify_disconnect)
+    p = sub.add_parser("ui", help="open Segue's interface in your browser")
+    p.add_argument("--port", type=int, default=8790)
+    p.add_argument("--no-browser", action="store_true", help="don't open the browser; just print the address")
+    p.set_defaults(func=cmd_ui)
+
     p = sub.add_parser("qobuz", help="connect to Qobuz (see docs/qobuz.md)")
     qobuz_sub = p.add_subparsers(dest="qobuz_command", required=True)
     q = qobuz_sub.add_parser("connect", help="sign in with a request copied from the Qobuz web player")
@@ -524,6 +529,14 @@ def cmd_check(store: Store, args) -> int:
     return 0
 
 
+def cmd_ui(store: Store, args) -> int:
+    from .web.server import serve
+
+    store.close()  # the server opens its own connections
+    serve(Path(args.db_path), args.port, open_browser=not args.no_browser)
+    return 0
+
+
 # Qobuz
 
 def _qobuz_session(args) -> SecretFile:
@@ -690,24 +703,14 @@ def _submit(store: Store, args, plan: edits.Plan) -> int:
 
 def _backup_gate(store: Store, args, ops) -> None:
     """Before deleting playlists, make sure their current version is in a backup."""
-    deleting = [op.playlist_id for op in ops if isinstance(op, DeletePlaylist)]
-    missing = backup.not_backed_up(store, deleting)
-    if not missing:
-        return
-    names = ", ".join(repr(store.playlist_state(pid).name) for pid in missing)
-    last = backup.last_backup_time(store)
-    since = f"The last backup is from {last[:10]}." if last else "You haven't made a backup yet."
-    _require_backup(store, args, f"{since} It doesn't include the current version of {names}.")
+    for reason in actions.delete_reasons(store, ops):
+        _require_backup(store, args, reason)
 
 
 def _service_backup_gate(store: Store, args, services: set[str]) -> None:
     """Before the first write to a service after pulling from it, make sure there's a backup."""
-    last = backup.last_backup_time(store)
-    stale = [s for s in sorted(services) if (pulled := remote.last_pull(store, s)) and (not last or last < pulled)]
-    if stale:
-        names = ", ".join(s.capitalize() for s in stale)
-        _require_backup(store, args, f"There's no backup since you last pulled from {names}, "
-                                     "and this is about to change playlists there.")
+    for reason in actions.service_reasons(store, services):
+        _require_backup(store, args, reason)
 
 
 def _gate_linked_services(store: Store, args) -> None:
